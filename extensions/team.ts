@@ -10,6 +10,7 @@ import {
 import { resolveConfig } from "../src/config.js";
 import { runSmallFlow, stopRun, type RunSummary } from "../src/engine.js";
 import { initTeam, type InitReport } from "../src/init.js";
+import { deliverReport, notify } from "../src/report.js";
 import { formatRolesTable } from "../src/roles.js";
 import { RpcClient } from "../src/rpc.js";
 
@@ -27,12 +28,14 @@ function getArgumentCompletions(argumentPrefix: string) {
   return /\s/.test(prefix) ? null : completions.filter(item => item.value.startsWith(prefix));
 }
 
-function sendReport(pi: ExtensionAPI, content: string): void {
-  try {
-    pi.sendMessage({ customType: "pi-team", content, display: true }, { deliverAs: "nextTurn" });
-  } catch {
-    return;
-  }
+function sendReport(pi: ExtensionAPI, mode: ExtensionCommandContext["mode"], text: string): void {
+  deliverReport(mode, text, content => {
+    try {
+      pi.sendMessage({ customType: "pi-team", content, display: true }, { deliverAs: "nextTurn" });
+    } catch {
+      return;
+    }
+  });
 }
 
 function formatInitReport(report: InitReport): string {
@@ -73,20 +76,20 @@ export default function teamExtension(pi: ExtensionAPI): void {
         switch (sub) {
           case "init": {
             const report = await initTeam({ ...opts, skillSourceDir, configDirName: CONFIG_DIR_NAME });
-            sendReport(pi, formatInitReport(report));
-            ctx.ui.notify("pi-team init done", "info");
+            sendReport(pi, ctx.mode, formatInitReport(report));
+            notify(ctx.mode, ctx.ui, "pi-team init done", "info");
             return;
           }
           case "roles": {
             const config = await resolveConfig(opts);
-            sendReport(pi, formatRolesTable(config));
-            ctx.ui.notify("pi-team roles listed", "info");
+            sendReport(pi, ctx.mode, formatRolesTable(config));
+            notify(ctx.mode, ctx.ui, "pi-team roles listed", "info");
             return;
           }
           case "run": {
             const taskFile = rest[0];
             if (!taskFile) {
-              ctx.ui.notify("Usage: /team run <task-file>", "error");
+              notify(ctx.mode, ctx.ui, "Usage: /team run <task-file>", "error");
               return;
             }
             const config = await resolveConfig(opts);
@@ -98,7 +101,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
                 { rpc, cwd: ctx.cwd, boardDir, config },
                 { taskFile, signal: ctx.signal },
               );
-              sendReport(pi, formatRunSummary(summary));
+              sendReport(pi, ctx.mode, formatRunSummary(summary));
             } finally {
               ctx.ui.setStatus("pi-team", undefined);
             }
@@ -112,15 +115,15 @@ export default function teamExtension(pi: ExtensionAPI): void {
               boardDir: join(ctx.cwd, config.board),
               config,
             });
-            ctx.ui.notify(result.stopped ? `stopped run ${result.runId}` : "no pi-team run is active", "info");
+            notify(ctx.mode, ctx.ui, result.stopped ? `stopped run ${result.runId}` : "no pi-team run is active", "info");
             return;
           }
           default:
-            ctx.ui.notify(usage, "info");
+            notify(ctx.mode, ctx.ui, usage, "info");
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        ctx.ui.notify(`pi-team ${sub} failed: ${message}`, "error");
+        notify(ctx.mode, ctx.ui, `pi-team ${sub} failed: ${message}`, "error");
       }
     },
   });
