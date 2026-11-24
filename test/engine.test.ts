@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
@@ -14,6 +14,7 @@ import {
   runSmallFlow,
   stopRun,
   updateRunLock,
+  updateTaskFile,
   type EngineDeps,
 } from "../src/engine.js";
 import type { RpcClient, SpawnOptions, SubagentInfo } from "../src/rpc.js";
@@ -162,6 +163,37 @@ test("task lookup ignores directories, sorts suffixes, and prefers an exact name
   await writeFile(join(boardDir, "T-001.md"), "");
   assert.equal(await findTaskFile(boardDir, "T-001"), "T-001.md");
   assert.equal(await findTaskFile(boardDir, "T-999"), undefined);
+});
+
+test("updateTaskFile accepts each supported path form", async (context) => {
+  const { boardDir, path, text } = await fixture(context);
+  for (const input of [filename, `.tasks/${filename}`, `./.tasks/${filename}`, path]) {
+    await context.test(input, async () => {
+      await updateTaskFile(boardDir, input, () => input);
+      assert.equal(await text(), input);
+    });
+  }
+});
+
+test("updateTaskFile cannot write outside the board", async (context) => {
+  const { boardDir, deps } = await fixture(context);
+  const outside = join(deps.cwd, "outside.md");
+  await writeFile(outside, "original");
+  await symlink(outside, join(boardDir, "link.md"));
+  const update = (input: string) => updateTaskFile(boardDir, input, () => "changed");
+  for (const input of ["../outside.md", "link.md", ".tasks/link.md"]) {
+    await assert.rejects(update(input), /must be inside the board directory/);
+  }
+  await assert.rejects(update("outside.md"), { code: "ENOENT" });
+  assert.equal(await readFile(outside, "utf8"), "original");
+});
+
+test("updateTaskFile reports the first ENOENT when neither path exists", async (context) => {
+  const { boardDir } = await fixture(context);
+  const input = ".tasks/missing.md";
+  await assert.rejects(updateTaskFile(boardDir, input, () => "changed"), {
+    code: "ENOENT", path: join(boardDir, input),
+  });
 });
 
 test("a passing gate and QA complete the task", async (context) => {

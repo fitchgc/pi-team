@@ -166,9 +166,20 @@ function checkInside(boardDir: string, path: string): void {
 }
 
 async function taskPath(boardDir: string, filename: string): Promise<string> {
-  const path = resolve(boardDir, filename);
-  checkInside(resolve(boardDir), path);
-  const [board, file] = await Promise.all([realpath(boardDir), realpath(path)]);
+  const root = resolve(boardDir);
+  const path = resolve(root, filename);
+  checkInside(root, path);
+  const board = await realpath(root);
+  const file = await realpath(path).catch(async (firstError: unknown) => {
+    const fallback = resolve(root, "..", filename);
+    if (fallback === path) throw firstError;
+    try {
+      checkInside(root, fallback);
+      return await realpath(fallback);
+    } catch {
+      throw firstError;
+    }
+  });
   checkInside(board, file);
   return file;
 }
