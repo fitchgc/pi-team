@@ -31,7 +31,7 @@ test("Team config defaults serialize with the schema first and six explicit mode
     architect: "llmapi/gpt-6.2-astra",
     coder: "llmapi/gpt-6.2-astra",
     qa: "llmapi/gpt-6.2-astra",
-    reviewer: "llmapi/gpt-6.2-sol",
+    reviewer: "llmapi/gpt-6.1-terra",
     "security-auditor": "llmapi/gpt-6.2-astra",
   });
   assert.deepEqual(Object.keys(models), ROLE_NAMES);

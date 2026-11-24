@@ -98,7 +98,7 @@ export const DEFAULT_CONFIG: TeamConfig = {
       maxTurns: 40,
     },
     reviewer: {
-      model: "llmapi/gpt-6.2-sol",
+      model: "llmapi/gpt-6.1-terra",
       skills: ["local-code-review"],
       tools: ["read", "grep", "find", "ls", "bash"],
       thinking: "high",

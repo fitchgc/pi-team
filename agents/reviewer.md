@@ -1,7 +1,7 @@
 ---
 description: 代码评审员，审代码质量，不验行为、不写代码
 tools: read, grep, find, ls, bash
-model: llmapi/gpt-6.2-sol
+model: llmapi/gpt-6.1-terra
 thinking: high
 max_turns: 30
 skills: local-code-review
