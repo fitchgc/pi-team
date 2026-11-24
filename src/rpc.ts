@@ -54,33 +54,42 @@ export class RpcError extends Error {
   }
 }
 
-interface RpcEnvelope {
-  success: boolean;
-  data?: unknown;
-  error?: string;
-}
-
-const requestPrefix = "subagents:rpc:";
-const defaultTimeoutMs = 30_000;
-
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function isSubagentInfo(value: unknown): value is SubagentInfo {
-  return isRecord(value)
-    && typeof value.id === "string"
-    && typeof value.status === "string";
+function isAgent(value: unknown): value is SubagentInfo {
+  if (!isRecord(value)) return false;
+
+  const strings = ["id", "type", "description", "status"];
+  const numbers = ["depth", "startedAt", "durationMs", "toolUses"];
+  const optionalStrings = ["parentAgentId", "workflowId", "result", "error", "structuredJson", "sessionFile"];
+  const optionalNumbers = ["completedAt", "durationMs"];
+  const flags = ["settling", "notificationPending"];
+  const tokens = value.tokens;
+
+  return strings.every(key => typeof value[key] === "string")
+    && numbers.every(key => typeof value[key] === "number")
+    && optionalStrings.every(key => value[key] === undefined || typeof value[key] === "string")
+    && optionalNumbers.every(key => value[key] === undefined || typeof value[key] === "number")
+    && flags.every(key => value[key] === undefined || typeof value[key] === "boolean")
+    && (tokens === undefined || (isRecord(tokens)
+      && typeof tokens.input === "number"
+      && typeof tokens.output === "number"
+      && typeof tokens.total === "number"));
 }
+
+type RequestName = "ping" | "spawn" | "stop" | "consume" | "steer" | "get" | "list";
 
 export class RpcClient {
   private readonly bus: EventBus;
   private readonly timeoutMs: number;
   private cachedProtocol: ProtocolInfo | undefined;
+  private pendingProtocol: Promise<ProtocolInfo> | undefined;
 
   constructor(bus: EventBus, opts?: { timeoutMs?: number }) {
     this.bus = bus;
-    this.timeoutMs = opts?.timeoutMs ?? defaultTimeoutMs;
+    this.timeoutMs = opts?.timeoutMs ?? 30_000;
   }
 
   get protocol(): ProtocolInfo | undefined {
@@ -91,74 +100,87 @@ export class RpcClient {
     return this.cachedProtocol?.features.includes(name) ?? false;
   }
 
-  private request<T>(
-    name: string,
-    payload: Record<string, unknown>,
-    timeoutMs = this.timeoutMs,
-  ): Promise<T> {
-    const channel = `${requestPrefix}${name}`;
+  private async request(
+    name: RequestName,
+    fields: Record<string, unknown> = {},
+    signal?: AbortSignal,
+  ): Promise<unknown> {
+    const channel = `subagents:rpc:${name}`;
     const requestId = randomUUID();
     const replyChannel = `${channel}:reply:${requestId}`;
+    let unsubscribe: (() => void) | undefined;
+    let onAbort: (() => void) | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
 
-    return new Promise<T>((resolve, reject) => {
-      let settled = false;
-      let unsubscribe: (() => void) | undefined;
-      const finish = (action: () => void): void => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        unsubscribe?.();
-        action();
-      };
-
-      unsubscribe = this.bus.on(replyChannel, (reply: unknown) => {
-        if (!isRecord(reply) || typeof reply.success !== "boolean") {
-          finish(() => reject(new RpcError(`malformed RPC reply on ${replyChannel}`)));
+    try {
+      return await new Promise<unknown>((resolve, reject) => {
+        onAbort = () => reject(new RpcError(`subagents RPC aborted: ${channel}`));
+        if (signal?.aborted) {
+          onAbort();
           return;
         }
-        const envelope = reply as unknown as RpcEnvelope;
-        if (!envelope.success) {
-          finish(() => reject(new RpcError(typeof envelope.error === "string" ? envelope.error : "")));
-          return;
-        }
-        finish(() => resolve(envelope.data as T));
+
+        signal?.addEventListener("abort", onAbort, { once: true });
+        unsubscribe = this.bus.on(replyChannel, (reply: unknown) => {
+          if (!isRecord(reply) || typeof reply.success !== "boolean") {
+            reject(new RpcError(`malformed RPC reply on ${channel}`));
+          } else if (reply.success) {
+            resolve(reply.data);
+          } else if (name === "consume") {
+            resolve(undefined);
+          } else if (typeof reply.error === "string") {
+            reject(new RpcError(reply.error));
+          } else {
+            reject(new RpcError(`malformed RPC reply on ${channel}`));
+          }
+        });
+        timer = setTimeout(() => {
+          if (name === "consume") {
+            resolve(undefined);
+          } else {
+            reject(new RpcError(`subagents RPC timed out: ${channel}`));
+          }
+        }, this.timeoutMs);
+        this.bus.emit(channel, { ...fields, requestId });
       });
-
-      const timer = setTimeout(() => {
-        finish(() => reject(new RpcError(`subagents RPC timed out: ${channel}`)));
-      }, timeoutMs);
-
-      try {
-        this.bus.emit(channel, { ...payload, requestId });
-      } catch (error: unknown) {
-        finish(() => reject(error instanceof Error ? error : new RpcError(String(error))));
-      }
-    });
+    } finally {
+      clearTimeout(timer);
+      if (onAbort) signal?.removeEventListener("abort", onAbort);
+      unsubscribe?.();
+    }
   }
 
   async ensureProtocol(): Promise<ProtocolInfo> {
     if (this.cachedProtocol) return this.cachedProtocol;
+    if (this.pendingProtocol) return this.pendingProtocol;
 
-    const reply = await this.request<unknown>("ping", {});
-    if (!isRecord(reply) || typeof reply.version !== "number") {
-      throw new RpcError("malformed ping reply");
+    this.pendingProtocol = this.request("ping").then(data => {
+      if (!isRecord(data) || typeof data.version !== "number") {
+        throw new RpcError("malformed ping reply");
+      }
+      if (data.version !== 2) {
+        throw new RpcError(`unsupported pi-subagents protocol version ${data.version}, expected 2`);
+      }
+      const features = Array.isArray(data.features)
+        ? data.features.filter((feature: unknown): feature is string => typeof feature === "string")
+        : [];
+      this.cachedProtocol = { version: data.version, features };
+      return this.cachedProtocol;
+    });
+    try {
+      return await this.pendingProtocol;
+    } finally {
+      this.pendingProtocol = undefined;
     }
-    if (reply.version !== 2) {
-      throw new RpcError(`unsupported pi-subagents protocol version ${reply.version}, expected 2`);
-    }
-    const features = Array.isArray(reply.features)
-      ? reply.features.filter((feature): feature is string => typeof feature === "string")
-      : [];
-    this.cachedProtocol = { version: reply.version, features };
-    return this.cachedProtocol;
   }
 
   async spawn(type: string, prompt: string, options?: SpawnOptions): Promise<{ id: string }> {
-    const data = await this.request<unknown>("spawn", {
-      type,
-      prompt,
-      ...(options === undefined ? {} : { options }),
-    });
+    const model = options?.model;
+    if (typeof model === "string" && !/^[^/\s]+\/\S+$/.test(model)) {
+      throw new RpcError("spawn model must be a full provider/modelId");
+    }
+    const fields = options === undefined ? { type, prompt } : { type, prompt, options };
+    const data = await this.request("spawn", fields);
     if (!isRecord(data) || typeof data.id !== "string") {
       throw new RpcError("malformed spawn reply");
     }
@@ -166,10 +188,8 @@ export class RpcClient {
   }
 
   async stop(agentId: string, settleTimeoutMs?: number): Promise<{ settled: boolean }> {
-    const data = await this.request<unknown>("stop", {
-      agentId,
-      ...(settleTimeoutMs === undefined ? {} : { settleTimeoutMs }),
-    });
+    const fields = settleTimeoutMs === undefined ? { agentId } : { agentId, settleTimeoutMs };
+    const data = await this.request("stop", fields);
     if (!isRecord(data) || typeof data.settled !== "boolean") {
       throw new RpcError("malformed stop reply");
     }
@@ -177,103 +197,96 @@ export class RpcClient {
   }
 
   async consume(agentId: string): Promise<void> {
-    // Older builds have no consume handler and never reply: a timeout (or any
-    // error here) is not an error — the completion notification is simply delivered.
-    try {
-      await this.request<unknown>("consume", { agentId });
-    } catch {
-      return;
-    }
+    await this.request("consume", { agentId });
   }
 
   consumeSync(agentId: string): void {
     try {
-      this.bus.emit(`${requestPrefix}consume`, {
-        requestId: randomUUID(),
-        agentId,
-      });
+      this.bus.emit("subagents:rpc:consume", { requestId: randomUUID(), agentId });
     } catch {
-      return;
+      // Notification suppression is best effort, including when a bus handler throws.
     }
   }
 
   async steer(agentId: string, message: string): Promise<void> {
-    await this.request<unknown>("steer", { agentId, message });
+    await this.request("steer", { agentId, message });
   }
 
-  async get(agentId: string): Promise<SubagentInfo> {
-    const data = await this.request<unknown>("get", { agentId });
-    if (!isRecord(data) || !isSubagentInfo(data.agent)) {
-      throw new RpcError("malformed get reply");
-    }
+  private async readAgent(agentId: string, signal?: AbortSignal): Promise<SubagentInfo> {
+    const data = await this.request("get", { agentId }, signal);
+    if (!isRecord(data) || !isAgent(data.agent)) throw new RpcError("malformed get reply");
     return data.agent;
   }
 
+  get(agentId: string): Promise<SubagentInfo> {
+    return this.readAgent(agentId);
+  }
+
   async list(): Promise<SubagentInfo[]> {
-    const data = await this.request<unknown>("list", {});
-    if (!isRecord(data) || !Array.isArray(data.agents) || !data.agents.every(isSubagentInfo)) {
+    const data = await this.request("list");
+    if (!isRecord(data) || !Array.isArray(data.agents) || !data.agents.every(isAgent)) {
       throw new RpcError("malformed list reply");
     }
     return data.agents;
   }
 
-  waitForCompletion(
+  async waitForCompletion(
     agentId: string,
     opts?: { timeoutMs?: number; signal?: AbortSignal },
   ): Promise<SubagentInfo> {
-    const timeoutMs = opts?.timeoutMs ?? this.timeoutMs;
     const signal = opts?.signal;
+    const abortError = () => new RpcError(`waiting for subagent aborted: ${agentId}`);
+    if (signal?.aborted) throw abortError();
 
-    if (signal?.aborted) {
-      return Promise.reject(new RpcError("waitForCompletion aborted"));
-    }
+    const reads = new AbortController();
+    const subscriptions: Array<() => void> = [];
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let claimed = false;
 
-    return new Promise<SubagentInfo>((resolve, reject) => {
-      let settled = false;
-      const unsubscribers: Array<() => void> = [];
-      const cleanup = (): void => {
-        clearTimeout(timer);
-        for (const unsubscribe of unsubscribers) unsubscribe();
-        signal?.removeEventListener("abort", onAbort);
-      };
-      const finish = (action: () => void): void => {
-        if (settled) return;
-        settled = true;
-        cleanup();
-        action();
-      };
-      const onAbort = (): void => {
-        finish(() => reject(new RpcError("waitForCompletion aborted")));
-      };
-      const handleEvent = (event: unknown): void => {
-        if (!isSubagentInfo(event) || event.id !== agentId) return;
-        this.consumeSync(agentId);
-        if (event.result !== undefined) {
-          finish(() => resolve(event));
-          return;
-        }
-        void this.get(agentId).then(
-          (info) => finish(() => resolve({ ...event, result: info.result })),
-          () => finish(() => resolve(event)),
-        );
-      };
+    try {
+      return await new Promise<SubagentInfo>((resolve, reject) => {
+        const onAbort = () => {
+          claimed = true;
+          reject(abortError());
+        };
+        signal?.addEventListener("abort", onAbort, { once: true });
+        subscriptions.push(() => signal?.removeEventListener("abort", onAbort));
 
-      unsubscribers.push(this.bus.on("subagents:completed", handleEvent));
-      unsubscribers.push(this.bus.on("subagents:failed", handleEvent));
-      const timer = setTimeout(() => {
-        finish(() => reject(new RpcError("waitForCompletion timed out")));
-      }, timeoutMs);
-      signal?.addEventListener("abort", onAbort, { once: true });
-
-      void this.get(agentId).then(
-        (info) => {
-          if (info.status !== "running" && info.status !== "queued") {
-            this.consumeSync(agentId);
-            finish(() => resolve(info));
+        const onTerminal = (info: unknown) => {
+          if (claimed || !isAgent(info) || info.id !== agentId) return;
+          claimed = true;
+          this.consumeSync(agentId);
+          if (info.result !== undefined) {
+            resolve(info);
+            return;
           }
-        },
-        () => undefined,
-      );
-    });
+
+          void this.readAgent(agentId, reads.signal).then(
+            current => resolve(current.result === undefined ? info : { ...info, result: current.result }),
+            () => resolve(info),
+          );
+        };
+        subscriptions.push(this.bus.on("subagents:completed", onTerminal));
+        subscriptions.push(this.bus.on("subagents:failed", onTerminal));
+        timer = setTimeout(() => {
+          claimed = true;
+          reject(new RpcError(`waiting for subagent timed out: ${agentId}`));
+        }, opts?.timeoutMs ?? this.timeoutMs);
+
+        void this.readAgent(agentId, reads.signal).then(info => {
+          if (claimed || info.status === "running" || info.status === "queued") return;
+          claimed = true;
+          this.consumeSync(agentId);
+          resolve(info);
+        }, () => {
+          // The agent may become visible only after the first lookup.
+        });
+      });
+    } finally {
+      claimed = true;
+      clearTimeout(timer);
+      for (const unsubscribe of subscriptions) unsubscribe();
+      reads.abort();
+    }
   }
 }
