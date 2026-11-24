@@ -1,0 +1,1 @@
+{"compilerOptions":{"forceConsistentCasingInFileNames":true,"module":"NodeNext","moduleResolution":"NodeNext","noEmit":true,"skipLibCheck":true,"strict":true,"target":"ES2022","types":["node"]},"exclude":["node_modules",".testbuild"],"include":["extensions/**/*.ts","src/**/*.ts","test/**/*.ts"]}
