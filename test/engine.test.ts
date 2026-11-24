@@ -11,6 +11,8 @@ import {
   lockPath,
   readRunLock,
   releaseRunLock,
+  runBigFlow,
+  runConfiguredFlow,
   runSmallFlow,
   stopRun,
   updateRunLock,
@@ -359,3 +361,107 @@ test("aborting a QA wait stops the recorded agent and preserves the coder record
   assert.match(file, /implemented X\nrun aborted by user/);
   assert.equal(await readRunLock(boardDir), undefined);
 });
+
+const reviewPass = "- verdict：通过\n- 证据：interface matches the design";
+const reviewReject = "- verdict: 打回\n- 打回的原因：\n  src/login.ts:12 leaks credentials";
+
+test("configured big flow shares design and runs gate, QA, then review", async (context) => {
+  const { deps, rpc, text, boardDir } = await fixture(context);
+  deps.config.defaultFlow = "big";
+  const stages: string[] = [];
+  rpc.onWait = async (id) => {
+    assert.equal((await readRunLock(boardDir))?.currentAgentId, id);
+    stages.push(rpc.calls[rpc.calls.length - 1].type);
+  };
+  deps.gate = async (command, cwd) => {
+    assert.equal(command, "true");
+    assert.equal(cwd, deps.cwd);
+    stages.push("gate");
+    return { passed: true, skipped: false, code: 0, timedOut: false, output: "ok" };
+  };
+  rpc.results.set("agent-1", "Use LoginResult");
+  rpc.results.set("agent-2", "implemented login");
+  rpc.results.set("agent-3", pass);
+  rpc.results.set("agent-4", reviewPass);
+  const result = await runConfiguredFlow(deps, { taskFile: filename });
+  assert.deepEqual(stages, ["architect", "coder", "gate", "qa", "reviewer"]);
+  assert.deepEqual(result, {
+    taskId: "T-001", runId: result.runId, status: "通过", rounds: 1,
+    fixRoundsUsed: 0, escalated: false, gatePassed: true, qaEvidence: "tests passed",
+  });
+  assert.equal(rpc.protocolChecks, 1);
+  assert.match(rpc.calls[0].prompt, /Implement login\./);
+  for (const call of rpc.calls.slice(1)) assert.match(call.prompt, /## 接口设计\nUse LoginResult/);
+  assert.match(rpc.calls[3].prompt, /implemented login/);
+  assert.match(rpc.calls[3].prompt, /## 验收结论\n- verdict：通过\n- 证据：tests passed/);
+  const file = await text();
+  assert.match(file, /^- 状态：通过$/m);
+  assert.match(file, /## 接口设计\nUse LoginResult/);
+  assert.match(file, /## 评审结论\n- verdict：通过\n- 证据：interface matches the design/);
+  assert.equal(await readRunLock(boardDir), undefined);
+});
+
+test("review rejection sends feedback to the coder and repeats verification", async (context) => {
+  const { deps, rpc, text } = await fixture(context);
+  rpc.results.set("agent-3", pass);
+  rpc.results.set("agent-4", reviewReject);
+  rpc.results.set("agent-6", pass);
+  rpc.results.set("agent-7", reviewPass);
+  const result = await runBigFlow(deps, { taskFile: filename });
+  assert.deepEqual(rpc.calls.map(call => call.type), [
+    "architect", "coder", "qa", "reviewer", "coder", "qa", "reviewer",
+  ]);
+  assert.match(rpc.calls[4].prompt, /src\/login\.ts:12 leaks credentials/);
+  assert.equal(result.status, "通过");
+  assert.equal(result.rounds, 2);
+  assert.equal(result.fixRoundsUsed, 1);
+  assert.equal(result.escalated, false);
+  assert.match(await text(), /## 评审结论\n- verdict：通过/);
+});
+
+test("QA and review spend the same fix budget and escalate on the final rejection", async (context) => {
+  const { deps, rpc, text, boardDir } = await fixture(context);
+  rpc.results.set("agent-3", reject);
+  rpc.results.set("agent-5", pass);
+  rpc.results.set("agent-6", reviewReject);
+  rpc.results.set("agent-8", pass);
+  rpc.results.set("agent-9", reviewReject);
+  const result = await runBigFlow(deps, { taskFile: filename });
+  assert.deepEqual(rpc.calls.map(call => call.type), [
+    "architect", "coder", "qa", "coder", "qa", "reviewer", "coder", "qa", "reviewer",
+  ]);
+  assert.match(rpc.calls[3].prompt, /## 打回原因\nmissing test/);
+  assert.deepEqual(result, {
+    taskId: "T-001", runId: result.runId, status: "打回", rounds: 3,
+    fixRoundsUsed: 2, escalated: true, gatePassed: true, qaEvidence: "tests passed",
+  });
+  const file = await text();
+  assert.match(file, /^- 状态：打回$/m);
+  assert.match(file, /fix budget exhausted after 2 fix rounds; escalate to a human\./);
+  assert.match(file, /## 验收结论\n- verdict：通过/);
+  assert.ok(file.includes(`## 评审结论\n${reviewReject}`));
+  assert.equal(await readRunLock(boardDir), undefined);
+});
+
+test("configured small flow only spawns coder and QA", async (context) => {
+  const { deps, rpc } = await fixture(context);
+  rpc.results.set("agent-2", pass);
+  assert.equal((await runConfiguredFlow(deps, { taskFile: filename })).status, "通过");
+  assert.deepEqual(rpc.calls.map(call => call.type), ["coder", "qa"]);
+});
+
+for (const disabled of ["architect", "reviewer"] as const) {
+  test(`big flow completes with ${disabled} disabled`, async (context) => {
+    const { deps, rpc, text } = await fixture(context);
+    deps.config.roles[disabled].enabled = false;
+    const expected = ["architect", "coder", "qa", "reviewer"].filter(name => name !== disabled);
+    rpc.results.set(`agent-${expected.indexOf("qa") + 1}`, pass);
+    if (disabled === "architect") rpc.results.set("agent-3", reviewPass);
+    const result = await runBigFlow(deps, { taskFile: filename });
+    assert.equal(result.status, "通过");
+    assert.equal(result.rounds, 1);
+    assert.deepEqual(rpc.calls.map(call => call.type), expected);
+    if (disabled === "architect") assert.match(await text(), /## 接口设计\narchitect disabled; skipped/);
+    else assert.doesNotMatch(await text(), /## 评审结论/);
+  });
+}

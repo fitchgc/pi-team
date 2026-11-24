@@ -216,12 +216,15 @@ function taskBrief(filename: string, text: string): string {
   ].join("\n");
 }
 
-function coderPrompt(filename: string, text: string, fixing: boolean): string {
+function coderPrompt(
+  filename: string, text: string, fixing: boolean, fixSection: "验收结论" | "评审结论" = "验收结论",
+): string {
   const lines = [taskBrief(filename, text)];
   if (fixing) {
-    const conclusion = getSection(text, "验收结论") ?? "";
+    const conclusion = getSection(text, fixSection) ?? "";
     // Gate output can span multiple lines after the 打回原因 field.
-    const reasons = conclusion.match(/^- 打回原因[ \t]*[:：][ \t]*([\s\S]*)/m)?.[1] ?? "";
+    const reasons = fixSection === "评审结论" ? conclusion
+      : conclusion.match(/^- 打回原因[ \t]*[:：][ \t]*([\s\S]*)/m)?.[1] ?? "";
     lines.push("", "## 打回原因", reasons, "Address every 打回原因 above.");
   }
   lines.push(
@@ -399,6 +402,205 @@ export async function runSmallFlow(
   } finally {
     await releaseRunLock(boardDir, runId);
   }
+}
+
+function reviewerPrompt(text: string): string {
+  return [
+    text,
+    "Review the current implementation against the interface design and QA evidence above.",
+    "Do not modify any files. Return a verdict line (- verdict：通过 or - verdict：打回),",
+    "followed by your evidence and actionable reasons for any rejection.",
+  ].join("\n");
+}
+
+export async function runBigFlow(
+  deps: EngineDeps,
+  opts: { taskFile: string; signal?: AbortSignal },
+): Promise<RunSummary> {
+  const { boardDir, rpc, config } = deps;
+  const { taskFile, signal } = opts;
+  const readTask = async () => readFile(await taskPath(boardDir, taskFile), "utf8");
+  const task = parseTaskFile(taskFile, await readTask());
+  if (!["待实现", "打回", "已中断"].includes(task.status ?? "")) {
+    throw new Error(`task ${task.id} is not runnable (status: ${task.status})`);
+  }
+
+  const { runId } = await acquireRunLock(boardDir, task.id);
+  try {
+    let rounds = 0;
+    let fixRoundsUsed = 0;
+    let gatePassed = false;
+    let qaEvidence = "";
+
+    const summary = (status: RunSummary["status"], escalated = false): RunSummary => ({
+      taskId: task.id, runId, status, rounds, fixRoundsUsed, escalated, gatePassed, qaEvidence,
+    });
+
+    const edit = async (mutate: (text: string) => string): Promise<string> => {
+      const text = await withBoard(boardDir, async () => {
+        await requireLock(boardDir, runId);
+        signal?.throwIfAborted();
+        return updateTaskFile(boardDir, taskFile, mutate);
+      });
+      signal?.throwIfAborted();
+      return text;
+    };
+
+    const agent = async (name: "architect" | "coder" | "qa" | "reviewer", prompt: string) => {
+      const role = config.roles[name];
+      const lock = await readRunLock(boardDir);
+      if (lock?.runId !== runId) throw new Error(`run ${runId} no longer owns the lock`);
+      signal?.throwIfAborted();
+      const { id } = await rpc.spawn(name, prompt, {
+        description: `pi-team ${name}: ${task.id}`,
+        ...(role.model !== undefined && { model: role.model }),
+        ...(role.maxTurns !== undefined && { maxTurns: role.maxTurns }),
+        ...(role.thinking !== undefined && { thinkingLevel: role.thinking }),
+      });
+      if (name === "coder") rounds++;
+      try {
+        await patchLock(boardDir, { currentAgentId: id }, runId);
+      } catch (error) {
+        await rpc.stop(id).catch(() => {});
+        throw error;
+      }
+      signal?.throwIfAborted();
+      const info = await rpc.waitForCompletion(id, { timeoutMs: agentTimeoutMs, signal });
+      signal?.throwIfAborted();
+      await withBoard(boardDir, async () => {
+        const current = await requireLock(boardDir, runId);
+        delete current.currentAgentId;
+        await writeFile(lockPath(boardDir), JSON.stringify(current));
+      });
+      if (info.status !== "completed") {
+        const failure = `${name} agent ${info.status}: ${info.error || "(no error)"}`;
+        await edit((fresh) => interrupted(fresh, failure));
+        return undefined;
+      }
+      return { id, info };
+    };
+
+    signal?.throwIfAborted();
+    for (const name of ["coder", "qa", "architect", "reviewer"] as const) {
+      const role = config.roles[name];
+      if (!role?.enabled) {
+        if (name === "coder" || name === "qa") throw new Error(`role ${name} is disabled`);
+        continue;
+      }
+      if (role.isolation !== undefined) {
+        throw new Error(`role ${name} requests worktree isolation, which is not available in v0.1`);
+      }
+    }
+
+    let text = await edit((fresh) => updateStatus(fresh, "实现中"));
+    await rpc.ensureProtocol();
+    const gate = deps.gate ?? runGate;
+
+    let designPrompt = "";
+    if (config.roles.architect.enabled) {
+      const architect = await agent("architect", [
+        taskBrief(taskFile, text),
+        "Design the shared interfaces and module boundaries. Do not modify any files.",
+        "Return the design for the implementer in your final message.",
+      ].join("\n"));
+      if (!architect) return summary("已中断");
+      const design = (architect.info.result || "(no result text)").replace(/^## /gm, "### ");
+      text = await edit((fresh) => updateSection(fresh, "接口设计", design));
+      designPrompt = `## 接口设计\n${design}\n\n`;
+    } else {
+      text = await edit((fresh) => updateSection(fresh, "接口设计", "architect disabled; skipped"));
+    }
+
+    let fixSection: "验收结论" | "评审结论" = "验收结论";
+    for (;;) {
+      if (fixRoundsUsed > 0) text = await readTask();
+      gatePassed = false;
+      qaEvidence = "";
+      const prompt = coderPrompt(taskFile, text, fixRoundsUsed > 0, fixSection);
+      const coder = await agent("coder", designPrompt + prompt);
+      if (!coder) return summary("已中断");
+
+      const record = [
+        `coder ${coder.id} (${coder.info.durationMs}ms, ${coder.info.toolUses} tool uses):`,
+        coder.info.result || "(no result text)",
+      ].join("\n");
+      await edit((fresh) => updateStatus(updateSection(fresh, "实现记录", record), "待验收"));
+      const { testCommand } = parseTaskFile(taskFile, await readTask());
+      signal?.throwIfAborted();
+      const result = await gate(testCommand, deps.cwd);
+      signal?.throwIfAborted();
+      gatePassed = result.passed;
+
+      let conclusion: NonNullable<ReturnType<typeof parseVerdict>>;
+      if (!gatePassed) {
+        conclusion = {
+          verdict: "打回",
+          evidence: result.output,
+          reasons: `gate failed: ${testCommand}\n${result.output}`,
+        };
+      } else {
+        const qa = await agent("qa", designPrompt + qaPrompt(taskFile, await readTask()));
+        if (!qa) return summary("已中断");
+        const reply = qa.info.result ?? "";
+        conclusion = parseVerdict(reply) ?? {
+          verdict: "打回",
+          evidence: reply || "(no result text)",
+          reasons: "QA returned no parseable verdict",
+        };
+      }
+
+      qaEvidence = conclusion.evidence;
+      let conclude = (fresh: string) => updateConclusion(fresh, conclusion);
+      let passed = conclusion.verdict === "通过";
+      fixSection = "验收结论";
+      if (passed && config.roles.reviewer.enabled) {
+        text = await edit(conclude);
+        const reviewer = await agent("reviewer", reviewerPrompt(text));
+        if (!reviewer) return summary("已中断");
+        const reply = (reviewer.info.result || "(no result text)").replace(/^## /gm, "### ");
+        const verdict = parseVerdict(reply);
+        passed = verdict?.verdict === "通过";
+        const report = verdict ? reply : [
+          "- verdict：打回", "- 打回原因：reviewer returned no parseable verdict", reply,
+        ].join("\n");
+        conclude = (fresh) => updateSection(fresh, "评审结论", report);
+        fixSection = "评审结论";
+      }
+      if (passed) {
+        await edit((fresh) => updateStatus(conclude(fresh), "通过"));
+        return summary("通过");
+      }
+      if (fixRoundsUsed >= config.fixBudget) {
+        const escalation = `fix budget exhausted after ${fixRoundsUsed} fix rounds; escalate to a human.`;
+        await edit((fresh) => updateStatus(appendRecord(conclude(fresh), escalation), "打回"));
+        return summary("打回", true);
+      }
+      fixRoundsUsed++;
+      await edit((fresh) => updateStatus(conclude(fresh), "实现中"));
+    }
+  } catch (error) {
+    const aborted = signal?.aborted || isAbort(error);
+    const message = aborted
+      ? "run aborted by user"
+      : `run failed: ${error instanceof Error ? error.message : String(error)}`;
+    await withBoard(boardDir, async () => {
+      const lock = await loadLock(boardDir);
+      if (lock?.runId !== runId) return;
+      if (lock.currentAgentId) await rpc.stop(lock.currentAgentId).catch(() => {});
+      await updateTaskFile(boardDir, taskFile, (text) => interrupted(text, message));
+    }).catch(() => {});
+    throw error;
+  } finally {
+    await releaseRunLock(boardDir, runId);
+  }
+}
+
+export function runConfiguredFlow(
+  deps: EngineDeps,
+  opts: { taskFile: string; signal?: AbortSignal },
+): Promise<RunSummary> {
+  const run = deps.config.defaultFlow === "big" ? runBigFlow : runSmallFlow;
+  return run(deps, opts);
 }
 
 export function stopRun(

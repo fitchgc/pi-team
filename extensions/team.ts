@@ -8,7 +8,7 @@ import {
   type ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
 import { resolveConfig } from "../src/config.js";
-import { runSmallFlow, stopRun, type RunSummary } from "../src/engine.js";
+import { runConfiguredFlow, stopRun, type RunSummary } from "../src/engine.js";
 import { initTeam, type InitReport } from "../src/init.js";
 import { deliverReport, notify } from "../src/report.js";
 import { formatRolesTable } from "../src/roles.js";
@@ -97,7 +97,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
             const rpc = new RpcClient(bus);
             ctx.ui.setStatus("pi-team", `running ${taskFile}…`);
             try {
-              const summary = await runSmallFlow(
+              const summary = await runConfiguredFlow(
                 { rpc, cwd: ctx.cwd, boardDir, config },
                 { taskFile, signal: ctx.signal },
               );
