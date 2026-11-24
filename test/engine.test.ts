@@ -368,6 +368,7 @@ const reviewReject = "- verdict: 打回\n- 打回的原因：\n  src/login.ts:12
 test("configured big flow shares design and runs gate, QA, then review", async (context) => {
   const { deps, rpc, text, boardDir } = await fixture(context);
   deps.config.defaultFlow = "big";
+  deps.git = async () => assert.fail("unmarked big flow must skip git");
   const stages: string[] = [];
   rpc.onWait = async (id) => {
     assert.equal((await readRunLock(boardDir))?.currentAgentId, id);
@@ -389,6 +390,7 @@ test("configured big flow shares design and runs gate, QA, then review", async (
     taskId: "T-001", runId: result.runId, status: "通过", rounds: 1,
     fixRoundsUsed: 0, escalated: false, gatePassed: true, qaEvidence: "tests passed",
   });
+  assert.equal(rpc.calls[1].options?.isolation, undefined);
   assert.equal(rpc.protocolChecks, 1);
   assert.match(rpc.calls[0].prompt, /Implement login\./);
   for (const call of rpc.calls.slice(1)) assert.match(call.prompt, /## 接口设计\nUse LoginResult/);
@@ -465,3 +467,179 @@ for (const disabled of ["architect", "reviewer"] as const) {
     else assert.doesNotMatch(await text(), /## 评审结论/);
   });
 }
+
+async function parallelFixture(context: TestContext, dependencies = ["", ""]) {
+  const setup = await fixture(context);
+  const { deps, path, rpc, boardDir } = setup;
+  await writeFile(path, (await setup.text()).replace("- 负责人", "- 并行：是\n- 负责人"));
+  const calls: string[] = [];
+  const deleted: string[] = [];
+  const gitResult = (stdout = "", code = 0) => ({ stdout, stderr: "", code, timedOut: false });
+  deps.git = async (args, cwd) => {
+    assert.equal(cwd, deps.cwd);
+    const command = args.join(" ");
+    calls.push(command);
+    if (command === "rev-parse --is-inside-work-tree") return gitResult("true");
+    if (command === "rev-parse HEAD") return gitResult("abc");
+    if (command === "config user.name") return gitResult("fitchgc");
+    if (command === "config user.email") return gitResult("zhl010101@gmail.com");
+    if (command.endsWith("MERGE_HEAD")) return gitResult("", 1);
+    if (args[1] === "--list") return gitResult(`  ${args[2].slice(0, -1)}\n`);
+    if (args[1] === "-d") deleted.push(args[2]);
+    if (args[0] === "diff") return gitResult(args[1] === "--name-only" ? "login.ts" : `patch ${args[1]}`);
+    return gitResult();
+  };
+  const plan = async () => {
+    for (const [index, blockers] of dependencies.entries()) {
+      const id = `T-001-${index + 1}`;
+      await writeFile(join(boardDir, `${id}-login.md`), [
+        `# ${id}`, "- 父任务：T-001", `- 依赖：${blockers}`, "## 需求", `Implement ${id}`,
+        "## 验收标准", "Tests pass",
+      ].join("\n"));
+    }
+  };
+  rpc.onWait = async id => {
+    const call = rpc.calls[Number(id.slice(6)) - 1];
+    if (call.type === "planner") await plan();
+    if (call.type === "qa" || call.type === "reviewer") rpc.results.set(id, pass);
+  };
+  rpc.results.set("agent-1", "LoginResult interface");
+  deps.gate = async () => {
+    calls.push("gate");
+    return { passed: true, skipped: false, output: "ok", code: 0, timedOut: false };
+  };
+  return { ...setup, calls, deleted, gitResult, runBig: () => runBigFlow(deps, { taskFile: filename }) };
+}
+
+test("parallel coders share a wave, then merge before verification", { timeout: 5000 }, async context => {
+  const { deps, rpc, boardDir, calls, deleted, text, runBig } = await parallelFixture(context);
+  let arrived = 0;
+  let release!: () => void;
+  const barrier = new Promise<void>(resolve => { release = resolve; });
+  const onWait = rpc.onWait!;
+  rpc.onWait = async id => {
+    await onWait(id);
+    if (!["agent-3", "agent-4"].includes(id)) return;
+    if (++arrived === 2) {
+      assert.deepEqual((await readRunLock(boardDir))?.currentAgentIds?.sort(), ["agent-3", "agent-4"]);
+      release();
+    }
+    await barrier;
+  };
+  const summary = await runBig();
+  assert.equal(summary.status, "通过");
+  assert.equal(summary.rounds, 2);
+  assert.deepEqual(rpc.calls.map(call => call.type), ["architect", "planner", "coder", "coder", "qa", "reviewer"]);
+  assert.match(rpc.calls[1].prompt, /local-to-tickets/);
+  for (const [index, call] of rpc.calls.slice(2, 4).entries()) {
+    assert.match(call.prompt, /LoginResult interface/);
+    assert.ok(call.prompt.includes(`Implement T-001-${index + 1}`));
+    assert.equal(call.options?.isolation, "worktree");
+    assert.equal(call.options?.cwd, deps.cwd);
+  }
+  assert.deepEqual(deleted, ["pi-agent-agent-3", "pi-agent-agent-4"]);
+  assert.equal(calls.at(-1), "gate");
+  assert.match(await text(), /^- 状态：通过$/m);
+  assert.equal(await readRunLock(boardDir), undefined);
+});
+
+test("conflict retains the second branch and reports both diffs", async context => {
+  const { deps, calls, deleted, boardDir, text, gitResult, runBig } = await parallelFixture(context);
+  const normal = deps.git!;
+  deps.git = async (args, cwd) => args[0] === "merge" && args.at(-1) === "pi-agent-agent-4"
+    ? gitResult("CONFLICT", 1) : normal(args, cwd);
+  const summary = await runBig();
+  assert.equal(summary.status, "打回");
+  assert.equal(summary.escalated, true);
+  assert.deepEqual(deleted, ["pi-agent-agent-3"]);
+  assert.ok(calls.includes("merge --abort"));
+  assert.ok(!calls.includes("gate"));
+  const board = await text();
+  assert.match(board, /^- 状态：打回$/m);
+  assert.match(board, /merge conflict: T-001-2 .* vs T-001-1/);
+  for (const expected of ["login.ts", "patch pi-agent-agent-4...HEAD", "patch HEAD...pi-agent-agent-4"]) {
+    assert.ok(board.includes(expected));
+  }
+  assert.equal(await readRunLock(boardDir), undefined);
+});
+
+test("no branch records no changes", async context => {
+  const { deps, deleted, text, gitResult, runBig } = await parallelFixture(context, [""]);
+  const normal = deps.git!;
+  deps.git = async (args, cwd) => args[1] === "--list" ? gitResult() : normal(args, cwd);
+  assert.equal((await runBig()).status, "通过");
+  assert.deepEqual(deleted, []);
+  assert.match(await text(), /T-001-1: no changes, nothing to merge/);
+});
+
+for (const invalid of ["non-git", "no HEAD", "isolation", "no identity"] as const) {
+  test(`parallel preflight rejects ${invalid} before spawning`, async context => {
+    const { deps, rpc, gitResult, runBig } = await parallelFixture(context);
+    if (invalid === "isolation") deps.config.roles.coder.isolation = "off";
+    else if (invalid === "no identity") deps.git = async args => {
+      if (args[0] === "rev-parse" && args[1] === "--is-inside-work-tree") return gitResult("true");
+      if (args[0] === "rev-parse" && args[1] === "HEAD") return gitResult("abc");
+      return gitResult("", 1);
+    };
+    else deps.git = async args => invalid === "no HEAD" && args[1] !== "HEAD" ? gitResult("true") : gitResult("", 1);
+    await assert.rejects(runBig(), invalid === "isolation" ? /coder isolation/ : invalid === "no identity" ? /user\.name/ : invalid === "no HEAD" ? /HEAD/ : /git worktree/);
+    assert.equal(rpc.calls.length, 0);
+  });
+}
+
+test("dependent coder starts after its blocker merges", async context => {
+  const { rpc, deleted, runBig } = await parallelFixture(context, ["", "T-001-1"]);
+  const spawn = rpc.spawn.bind(rpc);
+  rpc.spawn = async (type, prompt, opts) => {
+    if (type === "coder" && prompt.includes("Implement T-001-2")) assert.deepEqual(deleted, ["pi-agent-agent-3"]);
+    return spawn(type, prompt, opts);
+  };
+  assert.equal((await runBig()).status, "通过");
+});
+
+for (const [name, blockers, message] of [
+  ["empty", [], /no subtask files/], ["cycle beside a ready ticket", ["", "T-001-3", "T-001-2"], /cyclic/],
+] as const) {
+  test(`invalid plan: ${name}`, async context => {
+    const { rpc, runBig } = await parallelFixture(context, [...blockers]);
+    await assert.rejects(runBig(), message);
+    assert.deepEqual(rpc.calls.map(call => call.type), ["architect", "planner"]);
+  });
+}
+
+test("wave failure stops other active coders and releases the lock", { timeout: 5000 }, async context => {
+  const { rpc, boardDir, runBig } = await parallelFixture(context);
+  const normal = rpc.onWait!;
+  let ready!: () => void;
+  const both = new Promise<void>(resolve => { ready = resolve; });
+  rpc.onWait = async (id, signal) => {
+    if (id === "agent-3") {
+      await both;
+      throw new Error("wave wait failed");
+    }
+    if (id === "agent-4") {
+      ready();
+      await new Promise<void>(resolve => signal!.addEventListener("abort", () => resolve(), { once: true }));
+      signal!.throwIfAborted();
+    }
+    await normal(id, signal);
+  };
+  await assert.rejects(runBig(), /wave wait failed/);
+  assert.deepEqual(rpc.stopped.sort(), ["agent-3", "agent-4"]);
+  assert.equal(await readRunLock(boardDir), undefined);
+});
+
+test("parallel rejection spends one main-checkout fix round", async context => {
+  const { deps, rpc, runBig, text } = await parallelFixture(context, [""]);
+  const normal = deps.gate!;
+  let attempts = 0;
+  deps.gate = async (...args) => ++attempts === 1
+    ? { passed: false, skipped: false, output: "broken login", code: 1, timedOut: false } : normal(...args);
+  const summary = await runBig();
+  assert.equal(summary.status, "通过");
+  assert.equal(summary.fixRoundsUsed, 1);
+  const coders = rpc.calls.filter(call => call.type === "coder");
+  assert.deepEqual(coders.map(call => call.options?.isolation), ["worktree", undefined]);
+  assert.match(coders[1].prompt, /broken login/);
+  assert.match(await text(), /T-001-1: merged/);
+});

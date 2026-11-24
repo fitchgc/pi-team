@@ -5,6 +5,7 @@ export interface TaskFile {
   title: string;
   status?: string;
   testCommand?: string;
+  parallel?: boolean;
   raw: string;
 }
 
@@ -63,6 +64,9 @@ export function parseTaskFile(filename: string, text: string): TaskFile {
     raw: text,
   };
 
+  const header = text.split(/^## /m, 1)[0];
+  const parallel = header.match(/^- 并行[ \t]*[:：]([^\r\n]*)/m)?.[1];
+  if (parallel !== undefined) task.parallel = parallel.trim() === "是";
   const status = text.match(statusLine)?.[2]?.trim();
   if (status !== undefined) {
     task.status = status;

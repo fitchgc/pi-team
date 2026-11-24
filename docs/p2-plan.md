@@ -25,19 +25,53 @@ and escalates.
 
 ### P2-2: Parallel coders with worktree isolation
 
-Scope: split one task into subtasks, spawn one coder per subtask, each in an
+**Done 2026-11-24 (live-verified).** Scope: split one task into subtasks, spawn one coder per subtask, each in an
 isolated worktree (`isolation: "worktree"` on spawn), collect the results and
 merge them back into the main worktree. Worktree-isolation failure is an
 error that stops the run — never a silent fallback (grill decision, ADR 0007).
 
-Files: `src/engine.ts`, `src/rpc.ts` (isolation is already a spawn option).
+Files: `src/engine.ts`, `src/rpc.ts` (isolation is already a spawn option),
+`src/git.ts` (new), `src/tickets.ts` (new), `src/taskfile.ts`, `src/gate.ts`,
+`src/init.ts`.
 
 Acceptance: a task split into 2 subtasks completes with both coders' work
 merged and the gate passing.
 
-Open questions (need john's call): who decomposes the task into subtasks
-(planner agent vs dispatcher)? Who merges, and what happens on a merge
-conflict (stop and escalate, or retry)?
+Live verification (pi-team-parallel): T-005 (strings + arrays) — planner wrote
+2 subtask files, both coders ran in worktrees, settle committed to
+`pi-agent-<id>` branches, engine merged both in order and deleted the
+branches, gate + QA + reviewer passed, `node --test test/*.test.mjs` 12/12.
+T-004 ran first and exposed two gaps, both fixed/verified before T-005:
+(1) the worktree settle commits, so a project without git `user.name` /
+`user.email` silently loses the coders' work — the merge then reports
+"no changes" while the files sit staged in orphaned /tmp worktrees. Fixed
+with a preflight identity check (fail fast, clear message); pi-team-parallel
+now has identity configured. (2) the `/team` command timed out at the
+review stage in T-004 (Pi-side turn budget; reviewer verdict came from a
+supplementary review instead). T-005's reviewer instead hit transient
+upstream HTTP 502s from Llmapi (three failures, then a retry passed once
+the outage cleared) — infra flake, not a pi-team bug.
+
+Decompose (decided by john 2026-11-24): the planner — the role that organizes
+the requirement — splits the task with the `local-to-tickets` skill, along
+the module boundaries from the architect's interface design. The tickets'
+blocking edges decide what runs in parallel (no edges between them) and what
+runs in waves (topological order).
+
+Merge (decided by john 2026-11-24, accepts Muse's proposal): the engine — code,
+not an agent — applies each coder's worktree diff to the main worktree in
+dependency order. If every diff applies cleanly, the flow continues to
+gate/QA. On a conflict, the run stops and escalates to the user with a report
+(conflicting subtasks, files, both diffs); no auto-resolve, no integrator
+agent by default. Rationale: a conflict means two subtasks touched the same
+code with incompatible assumptions — a design divergence, and a model picking
+a side (or inventing a third version) hides it; the dispatcher never writes
+code (pi-team principle), and this matches the grill decision that
+worktree-isolation failure stops instead of silently degrading. A
+coder-as-integrator remains a manual fallback the user can trigger, not the
+default. If the user picks this proposal, the fix is at the decomposition
+step: the planner re-splits with cleaner boundaries, or the user resolves it
+himself.
 
 ### P2-3: Reviewer stage
 

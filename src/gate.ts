@@ -31,11 +31,12 @@ function signalGroup(pid: number, signal: NodeJS.Signals | 0): boolean {
 }
 
 export function runCommand(
-  cmd: string,
+  cmd: string | readonly [string, ...string[]],
   opts: { cwd: string; timeoutMs?: number },
 ): Promise<CommandResult> {
   return new Promise((resolve, reject) => {
-    const child = spawn("sh", ["-c", cmd], {
+    const [program, ...args] = typeof cmd === "string" ? ["sh", "-c", cmd] : cmd;
+    const child = spawn(program, args, {
       cwd: opts.cwd,
       shell: false,
       detached: true,

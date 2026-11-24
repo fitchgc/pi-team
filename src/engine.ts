@@ -2,8 +2,10 @@ import { randomBytes } from "node:crypto";
 import { mkdir, readFile, readdir, realpath, unlink, writeFile } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
-import type { ResolvedConfig } from "./config.js";
+import { parseAgentFile, type ResolvedConfig } from "./config.js";
 import { runGate, type GateResult } from "./gate.js";
+import { realGit, mergeTicket, type Git } from "./git.js";
+import { ticketFiles, ticketWaves } from "./tickets.js";
 import type { RpcClient } from "./rpc.js";
 import {
   getSection,
@@ -19,6 +21,8 @@ export interface RunLock {
   taskId: string;
   startedAt: number;
   currentAgentId?: string;
+  currentAgentIds?: string[];
+  taskFile?: string;
 }
 
 export interface EngineDeps {
@@ -26,6 +30,8 @@ export interface EngineDeps {
   cwd: string;
   boardDir: string;
   config: ResolvedConfig;
+  git?: Git;
+  agentDir?: string;
   gate?: (testCommand: string | undefined, cwd: string, timeoutMs?: number) => Promise<GateResult>;
 }
 
@@ -72,6 +78,9 @@ function isRunLock(value: unknown): value is RunLock {
     && "runId" in value && typeof value.runId === "string" && value.runId.length > 0
     && "taskId" in value && typeof value.taskId === "string" && value.taskId.length > 0
     && "startedAt" in value && typeof value.startedAt === "number" && Number.isFinite(value.startedAt)
+    && (!("taskFile" in value) || typeof value.taskFile === "string")
+    && (!("currentAgentIds" in value) || (Array.isArray(value.currentAgentIds)
+      && value.currentAgentIds.every(id => typeof id === "string" && id.length > 0)))
     && (!("currentAgentId" in value) || typeof value.currentAgentId === "string");
 }
 
@@ -446,34 +455,62 @@ export async function runBigFlow(
       return text;
     };
 
-    const agent = async (name: "architect" | "coder" | "qa" | "reviewer", prompt: string) => {
+    const agent = async (
+      name: "architect" | "planner" | "coder" | "qa" | "reviewer", prompt: string,
+      ticketId?: string, waitSignal = signal,
+    ) => {
       const role = config.roles[name];
       const lock = await readRunLock(boardDir);
       if (lock?.runId !== runId) throw new Error(`run ${runId} no longer owns the lock`);
       signal?.throwIfAborted();
-      const { id } = await rpc.spawn(name, prompt, {
-        description: `pi-team ${name}: ${task.id}`,
+      waitSignal?.throwIfAborted();
+      let type: string = name;
+      if (name === "coder" && !ticketId && task.parallel && role.isolation === "worktree") {
+        type = "pi-team-coder-main";
+        const alias = await readFile(join(deps.cwd, ".pi", "agents", `${type}.md`), "utf8").catch(() => "");
+        if (!alias || parseAgentFile(alias).frontmatter.isolation !== undefined) {
+          throw new Error("main-checkout coder unavailable; run /team init to generate pi-team-coder-main.md");
+        }
+      }
+      const { id } = await rpc.spawn(type, prompt, {
+        ...(ticketId && { cwd: deps.cwd, isolation: "worktree" as const }),
+        description: `pi-team ${name}: ${ticketId ?? task.id}`,
         ...(role.model !== undefined && { model: role.model }),
         ...(role.maxTurns !== undefined && { maxTurns: role.maxTurns }),
         ...(role.thinking !== undefined && { thinkingLevel: role.thinking }),
       });
       if (name === "coder") rounds++;
       try {
-        await patchLock(boardDir, { currentAgentId: id }, runId);
+        if (ticketId) {
+          await withBoard(boardDir, async () => {
+            const current = await requireLock(boardDir, runId);
+            waitSignal?.throwIfAborted();
+            (current.currentAgentIds ??= []).push(id);
+            await writeFile(lockPath(boardDir), JSON.stringify(current));
+          });
+        } else {
+          await patchLock(boardDir, { currentAgentId: id }, runId);
+        }
       } catch (error) {
         await rpc.stop(id).catch(() => {});
         throw error;
       }
       signal?.throwIfAborted();
-      const info = await rpc.waitForCompletion(id, { timeoutMs: agentTimeoutMs, signal });
+      const info = await rpc.waitForCompletion(id, { timeoutMs: agentTimeoutMs, signal: waitSignal, ...(ticketId && { settled: true }) });
       signal?.throwIfAborted();
       await withBoard(boardDir, async () => {
         const current = await requireLock(boardDir, runId);
-        delete current.currentAgentId;
+        if (ticketId) {
+          current.currentAgentIds = current.currentAgentIds?.filter(active => active !== id);
+          if (!current.currentAgentIds?.length) delete current.currentAgentIds;
+        } else {
+          delete current.currentAgentId;
+        }
         await writeFile(lockPath(boardDir), JSON.stringify(current));
       });
       if (info.status !== "completed") {
         const failure = `${name} agent ${info.status}: ${info.error || "(no error)"}`;
+        if (ticketId) throw new Error(`${ticketId}: ${failure}`);
         await edit((fresh) => interrupted(fresh, failure));
         return undefined;
       }
@@ -481,13 +518,42 @@ export async function runBigFlow(
     };
 
     signal?.throwIfAborted();
+    const git = (args: string[]) => (deps.git ?? realGit)(args, deps.cwd);
+    if (task.parallel) {
+      const isolation = config.roles.coder.isolation;
+      if (isolation !== undefined && isolation !== "worktree") {
+        throw new Error(`parallel coder isolation must be worktree; got ${isolation}`);
+      }
+      if (!config.roles.planner.enabled || config.roles.planner.isolation !== undefined) {
+        throw new Error("parallel planning requires an enabled planner in the main checkout");
+      }
+      for (const dir of [join(deps.cwd, ".pi"), deps.agentDir]) {
+        if (!dir) continue;
+        const settings = await readFile(join(dir, "subagents.json"), "utf8").catch((error: unknown) => {
+          if (!hasCode(error, "ENOENT")) throw error;
+          return "{}";
+        });
+        const enabled: unknown = JSON.parse(settings)?.worktreeIsolation;
+        if (enabled === false) throw new Error("parallel coding requires worktreeIsolation in subagents.json");
+        if (enabled === true) break;
+      }
+      const repo = await git(["rev-parse", "--is-inside-work-tree"]);
+      if (repo.code !== 0 || repo.stdout.trim() !== "true") throw new Error("parallel coding requires a git worktree");
+      if ((await git(["rev-parse", "HEAD"])).code !== 0) throw new Error("parallel coding requires a git repo with HEAD");
+      const author = await git(["config", "user.name"]);
+      const email = await git(["config", "user.email"]);
+      if (author.code !== 0 || !author.stdout.trim() || email.code !== 0 || !email.stdout.trim()) {
+        throw new Error("parallel coding requires git user.name and user.email (the worktree settle commits); set them with git config user.name \"...\" and git config user.email \"...\"");
+      }
+      await patchLock(boardDir, { taskFile }, runId);
+    }
     for (const name of ["coder", "qa", "architect", "reviewer"] as const) {
       const role = config.roles[name];
       if (!role?.enabled) {
         if (name === "coder" || name === "qa") throw new Error(`role ${name} is disabled`);
         continue;
       }
-      if (role.isolation !== undefined) {
+      if (role.isolation !== undefined && !(task.parallel && name === "coder")) {
         throw new Error(`role ${name} requests worktree isolation, which is not available in v0.1`);
       }
     }
@@ -511,20 +577,78 @@ export async function runBigFlow(
       text = await edit((fresh) => updateSection(fresh, "接口设计", "architect disabled; skipped"));
     }
 
+    if (task.parallel) {
+      const before = await ticketFiles(boardDir, task.id);
+      const planner = await agent("planner", [
+        taskBrief(taskFile, text), designPrompt,
+        `Use local-to-tickets along the design's module boundaries. The tracker is ${resolve(boardDir)}.`,
+        `Write or rewrite every ticket for this run as ${task.id}-<n>-<slug>.md. Its ID is ${task.id}-<n>.`,
+        `Include header lines '- 父任务：${task.id}' and '- 依赖：' (comma-separated blocking IDs or empty).`,
+        "Include ## 需求 and ## 验收标准. Write only subtask files. Leave the parent and code untouched.",
+      ].join("\n"));
+      if (!planner) return summary("已中断");
+      const waves = await ticketWaves(boardDir, task.id, before);
+      for (const wave of waves) {
+        const cancel = new AbortController();
+        const waveSignal = signal ? AbortSignal.any([signal, cancel.signal]) : cancel.signal;
+        const jobs = wave.map(async ticket => {
+          const coder = await agent("coder", [designPrompt, `Subtask file: ${ticket.filename}`, ticket.text,
+            "Implement only this ticket in your worktree and run its tests. Leave board files untouched.",
+          ].join("\n"), ticket.id, waveSignal);
+          if (!coder) throw new Error(`subtask ${ticket.id} interrupted`);
+          return { ticket, coder };
+        });
+        let results: Awaited<(typeof jobs)[number]>[];
+        try {
+          results = await Promise.all(jobs);
+        } catch (error) {
+          cancel.abort();
+          await withBoard(boardDir, async () => {
+            const lock = await loadLock(boardDir);
+            if (lock?.runId !== runId) return;
+            await stopAgents(rpc, lock);
+            delete lock.currentAgentIds;
+            await writeFile(lockPath(boardDir), JSON.stringify(lock));
+          });
+          await Promise.allSettled(jobs);
+          throw error;
+        }
+        const touched = new Map<string, string[]>();
+        for (const { ticket, coder } of results) {
+          const escalated = await withBoard(boardDir, async () => {
+            await requireLock(boardDir, runId);
+            signal?.throwIfAborted();
+            const merge = await mergeTicket(git, ticket.id, coder.id, touched);
+            await updateTaskFile(boardDir, taskFile, fresh => {
+              const record = appendRecord(fresh, `${merge.record}\n    ${(coder.info.result || "").replace(/\n/g, "\n    ")}`);
+              return merge.escalated ? updateStatus(record, "打回") : record;
+            });
+            return merge.escalated;
+          });
+          if (escalated) return summary("打回", true);
+        }
+      }
+      text = await edit(fresh => updateStatus(fresh, "待验收"));
+    }
+
     let fixSection: "验收结论" | "评审结论" = "验收结论";
     for (;;) {
       if (fixRoundsUsed > 0) text = await readTask();
       gatePassed = false;
       qaEvidence = "";
-      const prompt = coderPrompt(taskFile, text, fixRoundsUsed > 0, fixSection);
-      const coder = await agent("coder", designPrompt + prompt);
-      if (!coder) return summary("已中断");
+      if (!task.parallel || fixRoundsUsed > 0) {
+        const prompt = coderPrompt(taskFile, text, fixRoundsUsed > 0, fixSection);
+        const coder = await agent("coder", designPrompt + prompt);
+        if (!coder) return summary("已中断");
 
-      const record = [
-        `coder ${coder.id} (${coder.info.durationMs}ms, ${coder.info.toolUses} tool uses):`,
-        coder.info.result || "(no result text)",
-      ].join("\n");
-      await edit((fresh) => updateStatus(updateSection(fresh, "实现记录", record), "待验收"));
+        const record = [
+          `coder ${coder.id} (${coder.info.durationMs}ms, ${coder.info.toolUses} tool uses):`,
+          coder.info.result || "(no result text)",
+        ].join("\n");
+        await edit((fresh) => updateStatus(
+          task.parallel ? appendRecord(fresh, record) : updateSection(fresh, "实现记录", record), "待验收",
+        ));
+      }
       const { testCommand } = parseTaskFile(taskFile, await readTask());
       signal?.throwIfAborted();
       const result = await gate(testCommand, deps.cwd);
@@ -586,7 +710,7 @@ export async function runBigFlow(
     await withBoard(boardDir, async () => {
       const lock = await loadLock(boardDir);
       if (lock?.runId !== runId) return;
-      if (lock.currentAgentId) await rpc.stop(lock.currentAgentId).catch(() => {});
+      await stopAgents(rpc, lock);
       await updateTaskFile(boardDir, taskFile, (text) => interrupted(text, message));
     }).catch(() => {});
     throw error;
@@ -603,6 +727,12 @@ export function runConfiguredFlow(
   return run(deps, opts);
 }
 
+async function stopAgents(rpc: RpcClient, lock: RunLock): Promise<void> {
+  const ids = new Set(lock.currentAgentIds);
+  if (lock.currentAgentId) ids.add(lock.currentAgentId);
+  await Promise.all([...ids].map(id => rpc.stop(id).catch(() => {})));
+}
+
 export function stopRun(
   deps: EngineDeps,
   opts: { taskFile?: string } = {},
@@ -612,8 +742,8 @@ export function stopRun(
     const lock = await loadLock(boardDir);
     if (!lock) return { stopped: false };
     try {
-      if (lock.currentAgentId) await rpc.stop(lock.currentAgentId).catch(() => {});
-      const filename = opts.taskFile ?? await findTaskFile(boardDir, lock.taskId);
+      await stopAgents(rpc, lock);
+      const filename = opts.taskFile ?? lock.taskFile ?? await findTaskFile(boardDir, lock.taskId);
       if (filename) {
         await updateTaskFile(boardDir, filename, (text) => interrupted(text, "stopped by /team stop"))
           .catch(() => {});

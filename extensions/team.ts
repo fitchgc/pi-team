@@ -98,7 +98,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
             ctx.ui.setStatus("pi-team", `running ${taskFile}…`);
             try {
               const summary = await runConfiguredFlow(
-                { rpc, cwd: ctx.cwd, boardDir, config },
+                { rpc, cwd: ctx.cwd, boardDir, config, agentDir },
                 { taskFile, signal: ctx.signal },
               );
               sendReport(pi, ctx.mode, formatRunSummary(summary));

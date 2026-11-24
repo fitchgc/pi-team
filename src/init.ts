@@ -78,6 +78,16 @@ export async function initTeam(opts: {
       ? def.prompt.slice(GENERATED_MARKER.length).replace(/^\n+/, "")
       : def.prompt;
     const content = renderAgentFile({ ...def, prompt });
+    if (role === "coder" && def.isolation === "worktree") {
+      const alias = join(agentsDir, "pi-team-coder-main.md");
+      const main = renderAgentFile({ ...def, prompt, isolation: undefined });
+      if (await createFile(alias, main) === "exists") {
+        if (!isGeneratedAgentFile(await readFile(alias, "utf8"))) {
+          throw new Error(`cannot update hand-edited main-checkout coder: ${alias}`);
+        }
+        await writeFile(alias, main);
+      }
+    }
     if (await createFile(path, content) === "created") {
       report.agents.push({ role, action: "created" });
     } else if (isGeneratedAgentFile(await readFile(path, "utf8"))) {

@@ -232,7 +232,7 @@ export class RpcClient {
 
   async waitForCompletion(
     agentId: string,
-    opts?: { timeoutMs?: number; signal?: AbortSignal },
+    opts?: { timeoutMs?: number; signal?: AbortSignal; settled?: boolean },
   ): Promise<SubagentInfo> {
     const signal = opts?.signal;
     const abortError = () => new RpcError(`waiting for subagent aborted: ${agentId}`);
@@ -242,6 +242,7 @@ export class RpcClient {
     const subscriptions: Array<() => void> = [];
     let timer: ReturnType<typeof setTimeout> | undefined;
     let claimed = false;
+    let retry: ReturnType<typeof setTimeout> | undefined;
 
     try {
       return await new Promise<SubagentInfo>((resolve, reject) => {
@@ -273,16 +274,22 @@ export class RpcClient {
           reject(new RpcError(`waiting for subagent timed out: ${agentId}`));
         }, opts?.timeoutMs ?? this.timeoutMs);
 
-        void this.readAgent(agentId, reads.signal).then(info => {
+        const snapshot = (): Promise<void> => this.readAgent(agentId, reads.signal).then(info => {
           if (claimed || info.status === "running" || info.status === "queued") return;
+          if (opts?.settled && info.settling) {
+            retry = setTimeout(snapshot, 100);
+            return;
+          }
           claimed = true;
           this.consumeSync(agentId);
           resolve(info);
         }, () => {
           // The agent may become visible only after the first lookup.
         });
+        void snapshot();
       });
     } finally {
+      clearTimeout(retry);
       claimed = true;
       clearTimeout(timer);
       for (const unsubscribe of subscriptions) unsubscribe();
