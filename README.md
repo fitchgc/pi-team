@@ -18,10 +18,12 @@ v0.1 ships the small flow only. If you prefer to script the pipeline yourself, p
 ## Install
 
 ```bash
-pi install npm:@fitchgc/pi-team
+pi install git:github.com/fitchgc/pi-team@v0.1.0
 ```
 
 Requires Pi ≥ 1.1.0 and `@herbertgao/pi-subagents` (the extension drives subagents through its cross-extension RPC bus). The official `pi-subagents` package uses a different RPC protocol (v1); an adapter for it is planned, not yet built.
+
+The package is not on npm yet, so `pi install npm:@fitchgc/pi-team` does not work today; install from GitHub as above until it is published.
 
 ## Quick start
 
