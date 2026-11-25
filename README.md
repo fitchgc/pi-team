@@ -13,15 +13,15 @@ Pi extension that turns one Pi session into a multi-role coding team: the main s
 - **Verification independent of implementation, enforced by the engine, not by convention.** The coder cannot mark its own work done; the QA verdict decides.
 - **Deterministic orchestration.** The flow runs in code over the subagents RPC bus; models do the work, they don't decide the flow.
 
-v0.1 ships the small flow only. If you prefer to script the pipeline yourself, pi-subagents workflows can express much of the same — pi-team's value grows with the big flow (parallel coders, reviewer, security auditor), resume, and cost accounting.
+v0.2.0 ships the full pipeline: big flow (architect, parallel coders, reviewer, security auditor), resume, progress widget, interactive dispatch, and cost accounting. If you prefer to script the pipeline yourself, pi-subagents workflows can express much of the same — pi-team's value is the enforced process, not the mechanism.
 
 ## Install
 
 ```bash
-pi install git:github.com/fitchgc/pi-team@v0.1.0
+pi install git:github.com/fitchgc/pi-team@v0.2.0
 ```
 
-Requires Pi ≥ 1.1.0 and `@herbertgao/pi-subagents` (the extension drives subagents through its cross-extension RPC bus). The official `pi-subagents` package uses a different RPC protocol (v1); an adapter for it is planned, not yet built.
+Requires Pi ≥ 1.1.0 and `@herbertgao/pi-subagents` (the extension drives subagents through its cross-extension RPC bus). The official `pi-subagents` package uses a different RPC protocol (v1); pi-team ships an adapter for it — set `"subagents": "official"` in `.pi/team.json` (HerbertGao stays the default). Live verification of the official backend is still pending.
 
 The package is not on npm yet, so `pi install npm:@fitchgc/pi-team` does not work today; install from GitHub as above until it is published.
 
@@ -30,7 +30,9 @@ The package is not on npm yet, so `pi install npm:@fitchgc/pi-team` does not wor
 ```bash
 /team init     # write .pi/team.json and generate role files for this project
 /team roles    # show the effective roles, models, and where each came from
-/team run <task-file>   # run the pipeline: coder -> gate -> QA
+/team run <task-file>   # run the pipeline: architect -> coder -> gate -> QA -> reviewer
+/team status   # show the active run: stages, active agents, fix budget left
+/team resume <task-file>  # resume an interrupted run where it stopped
 ```
 
 ## Configure per project
@@ -39,4 +41,4 @@ The package is not on npm yet, so `pi install npm:@fitchgc/pi-team` does not wor
 
 ## Status
 
-v0.1 (in development): package skeleton, `/team init`, `/team roles`, `/team run` for the small flow. The big flow (architect, parallel coders, reviewer, security auditor), status widget, resume, and cost accounting come later.
+v0.2.0: big flow (architect, parallel coders, reviewer, security auditor), `/team status`, `/team resume`, progress widget, `team_dispatch` tool, and cost accounting on the official backend. npm publish is still pending.
