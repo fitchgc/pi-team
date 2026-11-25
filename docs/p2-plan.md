@@ -159,12 +159,16 @@ run lock already exists in v0.1).
 Tests: 113/113 (was 106, +7 status tests incl. the engine persisting
 `fixRoundsUsed === 2` after two QA rejections). tsc strict clean.
 
-Live verification: NOT done yet — needs a working Llmapi key (john is
-disabling the VM key used for P2-4/T-004). Two paths to check live:
-(1) no-run path: `/team status` in a project with no active run;
-(2) active-run path: start a `/team run`, call `/team status` mid-flight,
-then `/team stop`. P2 is code-complete with this unit; P2-5's live check
-is the only open item.
+Live verification: DONE 2026-11-25, both paths, key still live at the
+time (T-006 clamp task in pi-team-fresh): (1) no-run path → "no pi-team
+run is active"; (2) active-run path mid-flight →
+"pi-team run run-1795574942753-46630a / task: T-006 加一个 clamp 工具函数 /
+started: 2026/11/25 10:49:02 (2m ago) / status: 实现中 /
+stages: architect done, coder pending, qa pending, reviewer pending,
+security-auditor pending / active: coder (61664fd1-b9da-461) /
+fix budget: 2 of 2 remaining" — the `currentRoles` pairing works, the
+stage checklist reads the board correctly. P2 is now fully done
+(code + live): P2-1, P2-2, P2-3 (in P2-1), P2-4, P2-5.
 
 ## Order
 
