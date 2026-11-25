@@ -235,12 +235,14 @@ not guessed:
   "(partial)" when fewer agents reported than spawned. HerbertGao runs
   carry no cost field and no line. `/team status` does not show cost
   (the lock carries none) — future work.
-- Live verification: new project `~/workspace/pi-team-official`
-  (`.pi/settings.json` packages `["../pi-team", "npm:pi-subagents"]`,
-  `.pi/team.json` `subagents: "official"`), a small task via `/team run`
-  in print mode; the flow must complete and the summary must carry a
-  cost. Needs a working Llmapi key. A passing run also proves the
-  `finalOutput` result mapping live.
+- Live verification: PAUSED 2026-11-25 — implementation is done and pushed
+  (commit fa430de, tests 149/149, tsc clean), but the live run needs the
+  official package loaded in Pi, and installing it
+  (`pi install npm:pi-subagents` in `~/workspace/pi-team-official`)
+  tripped an execution-risk check: loading it would execute third-party
+  extension code. Awaiting john's go-ahead before running any task on
+  the official backend. A passing run would also prove the `finalOutput`
+  result mapping live.
 
 ## Order
 
