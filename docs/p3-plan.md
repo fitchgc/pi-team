@@ -235,14 +235,15 @@ not guessed:
   "(partial)" when fewer agents reported than spawned. HerbertGao runs
   carry no cost field and no line. `/team status` does not show cost
   (the lock carries none) — future work.
-- Live verification: PAUSED 2026-11-25 — implementation is done and pushed
-  (commit fa430de, tests 149/149, tsc clean), but the live run needs the
-  official package loaded in Pi, and installing it
+- Live verification: ON HOLD per john (2026-11-25 12:39, "先不跑，适配器
+  代码先放着") — implementation is done and pushed (commit fa430de,
+  tests 149/149, tsc clean), but the live run needs the official
+  package loaded in Pi, and installing it
   (`pi install npm:pi-subagents` in `~/workspace/pi-team-official`)
   tripped an execution-risk check: loading it would execute third-party
-  extension code. Awaiting john's go-ahead before running any task on
-  the official backend. A passing run would also prove the `finalOutput`
-  result mapping live.
+  extension code. The package stays installed but unloaded; the
+  verification waits for john to say go, whenever that is. A passing
+  run would also prove the `finalOutput` result mapping live.
 
 ## Order
 
