@@ -143,10 +143,15 @@ Decisions (verified against the installed Pi 1.5.2 types):
   present/absent, dispatch end-to-end with FakeRpc (file on disk, flow
   runs, summary returned, status 通过), lock conflict. The tool
   registration itself is verified live only.
-- Live verification: interactive TUI session — type a plain request in
-  the main session ("add isNegative to math.mjs"), watch the model call
-  `team_dispatch`, the widget show progress, the task complete, and the
-  main session narrate the result. Needs a working Llmapi key.
+- Live verification: DONE 2026-11-25 via a real TUI session (pi-team-fresh).
+  Typed a plain request in the main session ("在 math.mjs 里加一个
+  isNegative 工具函数…"), and the main session called `team_dispatch`
+  itself (task + title + acceptance, no nudge), the tool created
+  `T-010-add-isnegative-helper.md`, the widget tracked architect →
+  coder → qa → reviewer, the task ended 通过, and the main session
+  narrated the result — it even re-read the test file and re-ran
+  `node --test` itself (17 tests, 0 fail) before reporting. P3-3 is
+  fully done (code + live).
 
 Implementation: new `src/dispatch.ts` (`dispatchTask` — allocate id,
 write the task file, run the configured flow) + `allocateTaskId` /
@@ -161,8 +166,7 @@ task text contains a `- 测试命令：` line — `parseTaskFile` would read
 that line anywhere in the file as the test command and the gate would
 EXECUTE it, so dispatch refuses rather than letting model prose become
 an executable command; the error tells the model to indent the line.
-Live verification: NOT done yet — needs an interactive TUI session
-(main session must call the tool itself).
+- Live verification DONE 2026-11-25 (TUI, T-010 isNegative): main session called `team_dispatch` itself, widget tracked the stages, task 通过, main session narrated the result and re-ran `node --test` itself (17 tests, 0 fail). P3-3 is fully done. P3-4 cost accounting is next — but it stays gated on the official pi-subagents adapter decision (undecided).
 
 ## P3-4: cost accounting (last — gated on the adapter decision)
 
