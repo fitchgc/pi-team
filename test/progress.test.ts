@@ -8,7 +8,7 @@ import type { ResolvedConfig, RoleDefinition, RoleName } from "../src/config.js"
 import { runConfiguredFlow, type EngineDeps, type RunSummary } from "../src/engine.js";
 import { formatProgressLines, type ProgressStage, type RunProgress } from "../src/progress.js";
 import { resumeFlow } from "../src/resume.js";
-import type { RpcClient, SubagentInfo } from "../src/rpc.js";
+import type { RpcClientLike, SubagentInfo } from "../src/rpc.js";
 
 const taskFile = "T-001-progress.md";
 const pass = "- verdict：通过\n- 证据：测试通过";
@@ -19,7 +19,7 @@ function config(defaultFlow: ResolvedConfig["defaultFlow"]): ResolvedConfig {
     source: "package-default", jsonIgnored: false,
   });
   return {
-    board: ".tasks/", defaultFlow, fixBudget: 1,
+    subagents: "herbertgao", board: ".tasks/", defaultFlow, fixBudget: 1,
     securityAudit: { trigger: "label", label: "security-sensitive" },
     roles: {
       planner: role("planner"), architect: role("architect"), coder: role("coder"), qa: role("qa"),
@@ -58,7 +58,7 @@ async function fixture(context: TestContext, flow: ResolvedConfig["defaultFlow"]
   const rpc = new FakeRpc();
   const events: RunProgress[] = [];
   const deps: EngineDeps = {
-    cwd, boardDir, config: config(flow), rpc: rpc as unknown as RpcClient,
+    cwd, boardDir, config: config(flow), rpc: rpc as unknown as RpcClientLike,
     onProgress: progress => events.push(progress),
   };
   return { deps, events, rpc };

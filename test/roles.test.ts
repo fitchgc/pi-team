@@ -22,6 +22,7 @@ function config(): ResolvedConfig {
     board: ".tasks/",
     defaultFlow: "small",
     fixBudget: 2,
+    subagents: "herbertgao",
     securityAudit: { trigger: "label", label: "security-sensitive" },
     roles: {
       planner: role("planner"),

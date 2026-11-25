@@ -8,7 +8,7 @@ import { realGit, mergeTicket, type Git } from "./git.js";
 import type { ProgressCallback, ProgressStage } from "./progress.js";
 import { ticketFiles, ticketWaves } from "./tickets.js";
 import type { ResumeStage } from "./resume.js";
-import type { RpcClient, SubagentInfo } from "./rpc.js";
+import type { AgentCost, RpcClientLike, SubagentInfo } from "./rpc.js";
 import {
   getSection,
   parseTaskFile,
@@ -30,7 +30,7 @@ export interface RunLock {
 }
 
 export interface EngineDeps {
-  rpc: RpcClient;
+  rpc: RpcClientLike;
   cwd: string;
   boardDir: string;
   config: ResolvedConfig;
@@ -50,6 +50,27 @@ export interface RunSummary {
   escalationReason?: string;
   gatePassed: boolean;
   qaEvidence: string;
+  cost?: { totalUsd: number; partial: boolean; agents: RunCost[] };
+}
+
+type RunCost = AgentCost & { role: string; agentId: string };
+
+async function recordCost(rpc: RpcClientLike, costs: RunCost[], role: string, agentId: string): Promise<void> {
+  try {
+    const cost = await rpc.cost?.(agentId);
+    if (cost !== undefined) costs.push({ role, agentId, ...cost });
+  } catch {
+    return;
+  }
+}
+
+function summarizeCosts(agents: RunCost[], spawned: number): Pick<RunSummary, "cost"> {
+  if (!agents.length) return {};
+  return { cost: {
+    totalUsd: agents.reduce((total, agent) => total + agent.costUsd, 0),
+    partial: agents.length < spawned,
+    agents,
+  } };
 }
 
 const agentTimeoutMs = 4 * 60 * 60 * 1000;
@@ -298,6 +319,8 @@ export async function runSmallFlow(
     let rounds = 0;
     // A human-initiated resume gets a fresh fix budget.
     let fixRoundsUsed = 0;
+    const runCosts: RunCost[] = [];
+    let agentsSpawned = 0;
     const emit = (stage: ProgressStage, activeRole?: string) => {
       deps.onProgress?.({
         runId, taskId: task.id, stage, ...(activeRole !== undefined && { activeRole }),
@@ -310,6 +333,7 @@ export async function runSmallFlow(
 
     const summary = (status: RunSummary["status"], escalated = false, escalationReason?: string): RunSummary => ({
       taskId: task.id, runId, status, rounds, fixRoundsUsed, escalated, gatePassed, qaEvidence,
+      ...summarizeCosts(runCosts, agentsSpawned),
       ...(escalationReason !== undefined && { escalationReason }),
     });
 
@@ -334,6 +358,7 @@ export async function runSmallFlow(
         ...(role.maxTurns !== undefined && { maxTurns: role.maxTurns }),
         ...(role.thinking !== undefined && { thinkingLevel: role.thinking }),
       });
+      agentsSpawned++;
       if (name === "coder") rounds++;
       try {
         emit(name, name);
@@ -344,6 +369,7 @@ export async function runSmallFlow(
       }
       signal?.throwIfAborted();
       const info = await rpc.waitForCompletion(id, { timeoutMs: agentTimeoutMs, signal });
+      await recordCost(rpc, runCosts, name, info.id);
       signal?.throwIfAborted();
       await withBoard(boardDir, async () => {
         const current = await requireLock(boardDir, runId);
@@ -535,6 +561,8 @@ export async function runBigFlow(
     let rounds = 0;
     // A human-initiated resume gets a fresh fix budget.
     let fixRoundsUsed = 0;
+    const runCosts: RunCost[] = [];
+    let agentsSpawned = 0;
     const emit = (stage: ProgressStage, activeRole?: string) => {
       deps.onProgress?.({
         runId, taskId: task.id, stage, ...(activeRole !== undefined && { activeRole }),
@@ -543,11 +571,16 @@ export async function runBigFlow(
     };
     let startAt = opts.startAt ?? "architect";
     const planTickets = task.parallel && (startAt === "architect" || startAt === "coder");
+    if (planTickets && rpc.backend === "official") {
+      throw new Error("parallel coding is not supported on the official subagents backend yet "
+        + "(worktree isolation unverified); use the herbertgao backend or a non-parallel task");
+    }
     let gatePassed = false;
     let qaEvidence = "";
 
     const summary = (status: RunSummary["status"], escalated = false, escalationReason?: string): RunSummary => ({
       taskId: task.id, runId, status, rounds, fixRoundsUsed, escalated, gatePassed, qaEvidence,
+      ...summarizeCosts(runCosts, agentsSpawned),
       ...(escalationReason !== undefined && { escalationReason }),
     });
 
@@ -585,6 +618,7 @@ export async function runBigFlow(
         ...(role.maxTurns !== undefined && { maxTurns: role.maxTurns }),
         ...(role.thinking !== undefined && { thinkingLevel: role.thinking }),
       });
+      agentsSpawned++;
       if (name === "coder") rounds++;
       try {
         emit(name, name);
@@ -605,6 +639,7 @@ export async function runBigFlow(
       }
       signal?.throwIfAborted();
       const info = await rpc.waitForCompletion(id, { timeoutMs: agentTimeoutMs, signal: waitSignal, ...(ticketId && { settled: true }) });
+      await recordCost(rpc, runCosts, name, info.id);
       signal?.throwIfAborted();
       await withBoard(boardDir, async () => {
         const current = await requireLock(boardDir, runId);
@@ -856,7 +891,7 @@ export function runConfiguredFlow(
   return run(deps, opts);
 }
 
-async function stopAgents(rpc: RpcClient, lock: RunLock): Promise<void> {
+async function stopAgents(rpc: RpcClientLike, lock: RunLock): Promise<void> {
   const ids = new Set(lock.currentAgentIds);
   if (lock.currentAgentId) ids.add(lock.currentAgentId);
   await Promise.all([...ids].map(id => rpc.stop(id).catch(() => {})));

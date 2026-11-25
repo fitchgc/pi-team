@@ -26,7 +26,8 @@ function config(defaultFlow: ResolvedConfig["defaultFlow"] = "small"): ResolvedC
     source: "package-default", jsonIgnored: false,
   });
   return {
-    board: ".tasks/", fixBudget: 1, defaultFlow, securityAudit: { trigger: "label", label },
+    board: ".tasks/", fixBudget: 1, defaultFlow, subagents: "herbertgao",
+    securityAudit: { trigger: "label", label },
     roles: {
       planner: role("planner"), architect: role("architect"), coder: role("coder"), qa: role("qa"),
       reviewer: role("reviewer"), "security-auditor": role("security-auditor"),

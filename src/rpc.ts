@@ -47,6 +47,27 @@ export interface ProtocolInfo {
   features: string[];
 }
 
+export interface AgentCost {
+  costUsd: number;
+  inputTokens: number;
+  outputTokens: number;
+}
+
+export interface RpcClientLike {
+  readonly backend: "herbertgao" | "official";
+  ensureProtocol(): Promise<ProtocolInfo>;
+  hasFeature(name: string): boolean;
+  spawn(type: string, prompt: string, options?: SpawnOptions): Promise<{ id: string }>;
+  stop(agentId: string, settleTimeoutMs?: number): Promise<{ settled: boolean }>;
+  consume(agentId: string): Promise<void>;
+  consumeSync(agentId: string): void;
+  steer(agentId: string, message: string): Promise<void>;
+  get(agentId: string): Promise<SubagentInfo>;
+  list(): Promise<SubagentInfo[]>;
+  waitForCompletion(agentId: string, opts?: { timeoutMs?: number; signal?: AbortSignal; settled?: boolean }): Promise<SubagentInfo>;
+  cost?(agentId: string): Promise<AgentCost | undefined>;
+}
+
 export class RpcError extends Error {
   constructor(message: string) {
     super(message);
@@ -81,7 +102,8 @@ function isAgent(value: unknown): value is SubagentInfo {
 
 type RequestName = "ping" | "spawn" | "stop" | "consume" | "steer" | "get" | "list";
 
-export class RpcClient {
+export class RpcClient implements RpcClientLike {
+  readonly backend = "herbertgao" as const;
   private readonly bus: EventBus;
   private readonly timeoutMs: number;
   private cachedProtocol: ProtocolInfo | undefined;

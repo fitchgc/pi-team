@@ -25,6 +25,7 @@ async function fixture(context: TestContext, sections = "") {
   context.after(() => rm(cwd, { recursive: true, force: true }));
   const config: ResolvedConfig = {
     board: ".tasks/", fixBudget: 2, defaultFlow: "small",
+    subagents: "herbertgao",
     securityAudit: { trigger: "label", label: "security-sensitive" },
     roles: {
       planner: role("planner"), architect: role("architect"), coder: role("coder"),

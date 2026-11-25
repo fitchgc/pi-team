@@ -168,17 +168,79 @@ EXECUTE it, so dispatch refuses rather than letting model prose become
 an executable command; the error tells the model to indent the line.
 - Live verification DONE 2026-11-25 (TUI, T-010 isNegative): main session called `team_dispatch` itself, widget tracked the stages, task 通过, main session narrated the result and re-ran `node --test` itself (17 tests, 0 fail). P3-3 is fully done. P3-4 cost accounting is next — but it stays gated on the official pi-subagents adapter decision (undecided).
 
-## P3-4: cost accounting (last — gated on the adapter decision)
+## P3-4: cost accounting (adapter decided 2026-11-25, implementation next)
 
 Per-run cost summary, consistent with Pi's `/session` accounting
 (design doc line 278: "费用汇总与 `/session` 一致").
-Blocker: the subagent token/cost data is NOT visible to the extension
-through the HerbertGao RPC v2 (no cost method; `SubagentInfo` carries no
-usage) or through the main session's context usage (child sessions are
-separate). The official `pi-subagents` 0.90.0 HAS a `cost` method — so
-cost accounting needs the official-RPC adapter (open question from the
-2026-11-24 audit, undecided by john) or a design spike proving another
-source. Do not build this unit until the adapter question is decided.
+
+john said "继续" (2026-11-25 12:02) after the P3-3 report named the adapter
+as the blocker — taken as the go-ahead to build the adapter + cost.
+Decision: build the official-RPC adapter (config-selectable, HerbertGao
+stays the default), then cost accounting on top. No auto-probing: the
+backend is explicit in `.pi/team.json` (`subagents: "herbertgao" |
+"official"`, default `"herbertgao"`), so a project declares which package
+it installed. Probing (emit both pings, see which answers) stays a
+possible later improvement.
+
+Adapter design — verified against the official 0.90.0 SOURCE
+(`~/workspace/pi-audit/official-subagents/package/src/extension/rpc.js`,
+`src/slash/subagent-cost.js`, `src/runs/foreground/subagent-executor.js`),
+not guessed:
+- Transport: `{version: 1, requestId, method, params?}` on
+  `subagents:rpc:v1:request`; reply on
+  `subagents:rpc:v1:reply:<requestId>`; `{version: 1, requestId, method?,
+  success: true, data}` / `{success: false, error: {code, message}}`.
+- ping → `{version: 1, methods, capabilities: {cost: {version: 1},
+  resume, ...}, events: {asyncComplete: "subagent:async-complete", ...}}`.
+- spawn params (flat): `{agent, task, async: true, model?, cwd?,
+  worktree?, label?}`; model is top-level exact `provider/id`, thinking
+  maps to a `:<level>` suffix. Reply data: `{text, details: {mode:
+  "single", results: [], asyncId, asyncDir}}` — the run id is
+  `details.asyncId`.
+- Completion: subscribe `subagent:async-complete` (payload carries
+  `runId`/`state` but NO result text), then read targeted `status`
+  `{runId}` → `details.results[0].finalOutput` is the child result
+  text; empty `results` = still running; `status`/`exitCode`/`error`
+  decide completed vs failed. Poll status as a backstop (same pattern
+  as the HerbertGao snapshot fallback). `toolUses` is not carried —
+  report 0; `durationMs` is measured client-side (spawn → terminal).
+- stop params `{runId}` → `{runId, asyncDir, previousState, state:
+  "stopping", message}` — an acceptance receipt, NOT terminal proof,
+  so `stop()` returns `{settled: false}`.
+- cost params `{}` → `{version: 1, parent, children: [{label, agent?,
+  runId?, usage, sessionFile?}], childTotal, total,
+  unresolvedAsyncChildren}`; usage is `{input, output, cacheRead,
+  cacheWrite, cost, turns}`. Per-agent: match `children[].runId`;
+  fallback: `childTotal.cost` delta since the last cost call. The cost
+  call never fails a run — unavailability means "cost unavailable".
+- Interface: `RpcClientLike` in `src/rpc.ts` (methods the engine uses:
+  `ensureProtocol`, `spawn`, `stop`, `waitForCompletion`, `get`, `list`,
+  `steer`, `consume`, `consumeSync`, optional `cost?`, `backend`
+  discriminator, `hasFeature`); `RpcClient implements` it
+  (`backend: "herbertgao"`); new `OfficialRpcClient implements` it in
+  `src/rpc-official.ts` (`backend: "official"`); `EngineDeps.rpc`
+  becomes `RpcClientLike`. The extension picks the client from
+  `config.subagents` (run/resume/stop/dispatch cases).
+- Parallel guard: official worktree isolation for single-child RPC
+  spawns is UNVERIFIED (`isolation: "worktree"` passes validation and
+  maps to `worktree: true`, but whether it isolates a single spawn is
+  unknown) — a parallel task on the official backend throws a clear
+  error before the planner spawns (ADR 0007: fail loudly, never silent
+  fallback). Parallel stays HerbertGao-only until a live parallel run
+  proves it.
+- Cost accounting: after each agent completes, the engine calls
+  `rpc.cost?.(agentId)` (guarded, never throws); `RunSummary` gains
+  optional `cost: {totalUsd, agents: [{role, agentId, costUsd,
+  inputTokens, outputTokens}]}`; the report adds a `cost:` line, with
+  "(partial)" when fewer agents reported than spawned. HerbertGao runs
+  carry no cost field and no line. `/team status` does not show cost
+  (the lock carries none) — future work.
+- Live verification: new project `~/workspace/pi-team-official`
+  (`.pi/settings.json` packages `["../pi-team", "npm:pi-subagents"]`,
+  `.pi/team.json` `subagents: "official"`), a small task via `/team run`
+  in print mode; the flow must complete and the summary must carry a
+  cost. Needs a working Llmapi key. A passing run also proves the
+  `finalOutput` result mapping live.
 
 ## Order
 
@@ -189,4 +251,3 @@ hit a suspected Pi-side timeout mid-review on 2026-11-24). P3-2 next
 ## Not P3
 
 - P4 (npm publish) — needs john's npm login.
-- Official-RPC adapter itself — separate thread, decides P3-4.

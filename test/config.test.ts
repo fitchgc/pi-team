@@ -43,6 +43,12 @@ test("Team config defaults serialize with the schema first and six explicit mode
   assert.notEqual(defaults.roles.coder?.skills, DEFAULT_CONFIG.roles.coder?.skills);
 });
 
+test("subagents defaults to herbertgao and accepts only a supported backend", () => {
+  assert.equal(parseTeamConfig("{}").subagents, "herbertgao");
+  assert.equal(parseTeamConfig('{"subagents":"official"}').subagents, "official");
+  assert.throws(() => parseTeamConfig('{"subagents":"other"}'), /subagents must be one of/);
+});
+
 test("invalid Team config is rejected", () => {
   assert.throws(() => parseTeamConfig("{"), SyntaxError);
   assert.throws(() => parseTeamConfig('{"version":2}'), /unsupported team\.json version/);

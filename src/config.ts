@@ -24,6 +24,7 @@ export interface RoleOverride {
 
 export interface TeamConfig {
   version: 1;
+  subagents: "herbertgao" | "official";
   board: string;
   dispatcherModel?: string;
   fixBudget: number;
@@ -53,6 +54,7 @@ export interface RoleDefinition extends AgentFrontmatter {
 }
 
 export interface ResolvedConfig {
+  subagents: TeamConfig["subagents"];
   board: string;
   dispatcherModel?: string;
   fixBudget: number;
@@ -63,6 +65,7 @@ export interface ResolvedConfig {
 
 export const DEFAULT_CONFIG: TeamConfig = {
   version: 1,
+  subagents: "herbertgao",
   board: ".tasks/",
   dispatcherModel: "llmapi/gpt-6.2-sol",
   fixBudget: 2,
@@ -265,6 +268,9 @@ function parseLayer(text: string): ConfigLayer {
       case "$schema":
         stringValue(value, key, true);
         break;
+      case "subagents":
+        layer.subagents = choice(value, ["herbertgao", "official"] as const, key);
+        break;
       case "board":
       case "dispatcherModel":
         layer[key] = stringValue(value, key);
@@ -415,9 +421,9 @@ export async function resolveConfig(opts: {
     roles[name] = role;
   }
 
-  const { board, dispatcherModel, fixBudget, defaultFlow, securityAudit } = config;
+  const { subagents, board, dispatcherModel, fixBudget, defaultFlow, securityAudit } = config;
   return {
-    board, fixBudget, defaultFlow, securityAudit, roles,
+    subagents, board, fixBudget, defaultFlow, securityAudit, roles,
     ...(dispatcherModel === undefined ? {} : { dispatcherModel }),
   };
 }

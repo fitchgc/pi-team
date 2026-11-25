@@ -9,7 +9,7 @@ import {
   type ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { resolveConfig } from "../src/config.js";
+import { resolveConfig, type ResolvedConfig } from "../src/config.js";
 import { dispatchTask } from "../src/dispatch.js";
 import { runConfiguredFlow, stopRun, type RunSummary } from "../src/engine.js";
 import { initTeam, type InitReport } from "../src/init.js";
@@ -17,7 +17,8 @@ import { formatProgressLines, type RunProgress } from "../src/progress.js";
 import { deliverReport, notify } from "../src/report.js";
 import { resumeFlow } from "../src/resume.js";
 import { formatRolesTable } from "../src/roles.js";
-import { RpcClient } from "../src/rpc.js";
+import { OfficialRpcClient } from "../src/rpc-official.js";
+import { RpcClient, type EventBus, type RpcClientLike } from "../src/rpc.js";
 import { formatRunStatus, getRunStatus } from "../src/status.js";
 
 const packageDir = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -67,7 +68,18 @@ function formatRunSummary(summary: RunSummary): string {
       ? `escalated: ${summary.escalationReason} — needs a human`
       : "escalated: needs a human");
   }
+  if (summary.cost !== undefined) {
+    const { agents, totalUsd, partial } = summary.cost;
+    const breakdown = agents.length > 1
+      ? ` (${agents.map(agent => `${agent.role} $${agent.costUsd.toFixed(4)}`).join(", ")})`
+      : "";
+    lines.push(`cost: $${totalUsd.toFixed(4)} total${breakdown}${partial ? " (partial)" : ""}`);
+  }
   return lines.join("\n");
+}
+
+function createRpcClient(config: ResolvedConfig, bus: EventBus): RpcClientLike {
+  return config.subagents === "official" ? new OfficialRpcClient(bus) : new RpcClient(bus);
 }
 
 export default function teamExtension(pi: ExtensionAPI): void {
@@ -107,7 +119,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
       try {
         const config = await resolveConfig({ projectDir: ctx.cwd, packageDir, agentDir });
         const boardDir = join(ctx.cwd, config.board);
-        const rpc = new RpcClient(bus);
+        const rpc = createRpcClient(config, bus);
         const updateProgress = (progress: RunProgress) => {
           ctx.ui.setStatus("pi-team", `running ${progress.taskId}… ${progress.stage}`);
           if (ctx.mode === "tui") {
@@ -165,7 +177,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
             }
             const config = await resolveConfig(opts);
             const boardDir = join(ctx.cwd, config.board);
-            const rpc = new RpcClient(bus);
+            const rpc = createRpcClient(config, bus);
             ctx.ui.setStatus("pi-team", `running ${taskFile}…`);
             try {
               const summary = await runConfiguredFlow(
@@ -186,7 +198,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
             }
             const config = await resolveConfig(opts);
             const boardDir = join(ctx.cwd, config.board);
-            const rpc = new RpcClient(bus);
+            const rpc = createRpcClient(config, bus);
             ctx.ui.setStatus("pi-team", `resuming ${taskFile}…`);
             try {
               const summary = await resumeFlow(
@@ -213,7 +225,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
           case "stop": {
             const config = await resolveConfig(opts);
             const result = await stopRun({
-              rpc: new RpcClient(bus),
+              rpc: createRpcClient(config, bus),
               cwd: ctx.cwd,
               boardDir: join(ctx.cwd, config.board),
               config,
