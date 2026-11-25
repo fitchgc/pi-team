@@ -100,14 +100,69 @@ main model as a prompt — interrupted with Ctrl+C, no harm); Pi 1.6.0 is
 available (we run 1.5.2 — do not upgrade mid-roadmap). P3-2 is fully
 done (code + live).
 
-## P3-3: interactive `team_dispatch` (after the widget)
+## P3-3: interactive `team_dispatch` — DONE (2026-11-25, implementation + tests; live check pending)
 
-A dispatcher entry point for interactive use, as opposed to the
-print-mode `/team run` command. Design still open: most likely a
-registered TOOL (not just a slash command) the main session can call,
-with interactive confirmation / stage progress via the P3-2 widget.
-Do not start before the widget lands — the dispatch UX depends on it.
-Needs a short design note before implementation.
+The main session dispatches work to the team and watches it: the dispatcher
+as a persistent role in the main session. Today `/team run` is user-invoked;
+`team_dispatch` lets the main session do it, so the user just says "add X"
+in the main session and the main session creates the task, runs the team,
+and reports back.
+
+Decisions (verified against the installed Pi 1.5.2 types):
+- A registered TOOL, not a slash command: `pi.registerTool` with a TypeBox
+  parameter schema (`typebox` is already a pi-team peerDependency).
+  Name `team_dispatch`. The main session calls it; the user never types it.
+- Parameters: `task` (required, the requirement in the user's words),
+  `title` (optional, short title for the task file), `acceptance`
+  (optional, acceptance criteria, one per line), `parallel` (optional,
+  default false), `labels` (optional string[], e.g. `["security-sensitive"]`).
+- Behavior: allocate the next task id (scan `.tasks/T-*.md`, max+1),
+  write the task file in the board format (status 待实现; `- 并行：是` /
+  `- 标签：` headers when set; `## 需求` + task; `## 验收标准` + acceptance,
+  omitted when absent), then run the same flow as `/team run`
+  (config `defaultFlow`; widget progress via the P3-2 `onProgress`
+  callback; the tool's AbortSignal passed through to the flow).
+  Returns the run summary as the tool result text. One run at a time:
+  the engine lock enforces it; on a lock conflict the task file stays
+  as 待实现 (the user can `/team run` it later) and the tool returns an
+  `isError` result the main session can explain.
+- Confirmation: NO `ctx.ui.confirm` dialog (it exists, but it is not
+  used). The main session's conversation is the confirmation layer —
+  the model asks the user in chat when the request is vague and calls
+  the tool when it is clear. The tool is only reachable by the main
+  session, never by a raw user keystroke, so the model is the gate.
+- `executionMode: "sequential"` (a minutes-long dispatch must not run
+  concurrently with other tool calls). Errors from the flow are returned
+  as `isError` results, not thrown. The tool errors clearly when the
+  project is not initialized (`/team init` not run).
+- Files: new `src/dispatch.ts` (`dispatchTask`, engine-level, testable
+  with FakeRpc); task-file building in `src/taskfile.ts`
+  (`allocateTaskId` + `buildTaskContent`); thin tool handler in
+  `extensions/team.ts`. No changes to the flows, the lock, or `/team run`.
+- Tests: id allocation, slug/title, parallel/labels headers, acceptance
+  present/absent, dispatch end-to-end with FakeRpc (file on disk, flow
+  runs, summary returned, status 通过), lock conflict. The tool
+  registration itself is verified live only.
+- Live verification: interactive TUI session — type a plain request in
+  the main session ("add isNegative to math.mjs"), watch the model call
+  `team_dispatch`, the widget show progress, the task complete, and the
+  main session narrate the result. Needs a working Llmapi key.
+
+Implementation: new `src/dispatch.ts` (`dispatchTask` — allocate id,
+write the task file, run the configured flow) + `allocateTaskId` /
+`buildTaskContent` in `src/taskfile.ts` + the `team_dispatch` tool
+registration in `extensions/team.ts` (TypeBox params, sequential,
+errors as `isError` results). Tests: 135/135 (was 129, +6 dispatch
+tests incl. id allocation, exact file format, end-to-end dispatch,
+lock conflict leaving the file 待实现). tsc strict clean. The Codex
+diff applied cleanly on the first check again.
+Note (Codex's own addition, kept): `dispatchTask` rejects input whose
+task text contains a `- 测试命令：` line — `parseTaskFile` would read
+that line anywhere in the file as the test command and the gate would
+EXECUTE it, so dispatch refuses rather than letting model prose become
+an executable command; the error tells the model to indent the line.
+Live verification: NOT done yet — needs an interactive TUI session
+(main session must call the tool itself).
 
 ## P3-4: cost accounting (last — gated on the adapter decision)
 

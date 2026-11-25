@@ -4,10 +4,13 @@ import { fileURLToPath } from "node:url";
 import {
   CONFIG_DIR_NAME,
   getAgentDir,
+  type AgentToolResult,
   type ExtensionAPI,
   type ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import { resolveConfig } from "../src/config.js";
+import { dispatchTask } from "../src/dispatch.js";
 import { runConfiguredFlow, stopRun, type RunSummary } from "../src/engine.js";
 import { initTeam, type InitReport } from "../src/init.js";
 import { formatProgressLines, type RunProgress } from "../src/progress.js";
@@ -74,6 +77,60 @@ export default function teamExtension(pi: ExtensionAPI): void {
     on: (event: string, handler: (data: unknown) => void) => pi.events.on(event, handler),
     emit: (event: string, payload: unknown) => pi.events.emit(event, payload),
   };
+
+  pi.registerTool({
+    name: "team_dispatch",
+    label: "team_dispatch",
+    description: "Dispatch a coding task to the pi-team multi-agent team (architect → coder → gate → QA → reviewer, plus security auditor when labeled). Use this when the user asks for a code change in a project initialized with pi-team (/team init), instead of implementing it yourself. The tool creates a task file on the board, runs the full team flow, and returns the run summary. It takes minutes; do not call it twice for the same request, and do not call it while another dispatch is running.",
+    promptGuidelines: [
+      "Only call team_dispatch in a project initialized with pi-team (a .pi/team.json exists); otherwise tell the user to run /team init first.",
+    ],
+    parameters: Type.Object({
+      task: Type.String({
+        description: "The requirement, in the user's words. Write it as a concrete, implementable request.",
+      }),
+      title: Type.Optional(Type.String({
+        description: "Short title for the task file, e.g. 'add isNegative helper'. Defaults to the first line of task.",
+      })),
+      acceptance: Type.Optional(Type.String({
+        description: "Acceptance criteria, one per line. Omit when the requirement itself states what done means.",
+      })),
+      parallel: Type.Optional(Type.Boolean({
+        description: "Set true only when the task splits into independent subtasks the planner should decompose.",
+      })),
+      labels: Type.Optional(Type.Array(Type.String(), {
+        description: "Task labels, e.g. ['security-sensitive'] to trigger the security auditor.",
+      })),
+    }),
+    executionMode: "sequential",
+    async execute(_toolCallId, params, signal, _onUpdate, ctx): Promise<AgentToolResult<RunSummary | { error: string }>> {
+      try {
+        const config = await resolveConfig({ projectDir: ctx.cwd, packageDir, agentDir });
+        const boardDir = join(ctx.cwd, config.board);
+        const rpc = new RpcClient(bus);
+        const updateProgress = (progress: RunProgress) => {
+          ctx.ui.setStatus("pi-team", `running ${progress.taskId}… ${progress.stage}`);
+          if (ctx.mode === "tui") {
+            ctx.ui.setWidget("pi-team", formatProgressLines(progress), { placement: "aboveEditor" });
+          }
+        };
+        ctx.ui.setStatus("pi-team", "dispatching task…");
+        try {
+          const summary = await dispatchTask(
+            { rpc, cwd: ctx.cwd, boardDir, config, agentDir, onProgress: updateProgress },
+            params, signal,
+          );
+          return { content: [{ type: "text", text: formatRunSummary(summary) }], details: summary };
+        } finally {
+          ctx.ui.setStatus("pi-team", undefined);
+          if (ctx.mode === "tui") ctx.ui.setWidget("pi-team", undefined);
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return { content: [{ type: "text", text: message }], details: { error: message }, isError: true };
+      }
+    },
+  });
 
   pi.registerCommand("team", {
     description: "Multi-role coding team: init | roles | run <task-file> | resume <task-file> | status | stop",

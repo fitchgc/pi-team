@@ -1,4 +1,36 @@
+import { readdir } from "node:fs/promises";
 import { basename } from "node:path";
+
+import type { DispatchInput } from "./dispatch.js";
+
+export async function allocateTaskId(boardDir: string): Promise<string> {
+  let maxId = 0n;
+  try {
+    const entries = await readdir(boardDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isFile()) continue;
+      const match = /^T-(\d+)-.*\.md$/.exec(entry.name);
+      if (match && BigInt(match[1]) > maxId) maxId = BigInt(match[1]);
+    }
+  } catch (error) {
+    if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+  }
+  return `T-${String(maxId + 1n).padStart(3, "0")}`;
+}
+
+export function buildTaskContent(
+  taskId: string, input: DispatchInput,
+): { fileName: string; content: string } {
+  const title = (input.title ?? input.task.split(/\r?\n/, 1)[0]).trim();
+  const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "").slice(0, 40).replace(/-$/, "") || "task";
+  const lines = [`# ${taskId}: ${title.slice(0, 80)}`, "", "- 状态：待实现"];
+  if (input.parallel) lines.push("- 并行：是");
+  if (input.labels?.length) lines.push(`- 标签：${input.labels.join(", ")}`);
+  lines.push("", "## 需求", input.task);
+  if (input.acceptance?.trim()) lines.push("", "## 验收标准", input.acceptance);
+  return { fileName: `${taskId}-${slug}.md`, content: lines.join("\n") + "\n" };
+}
 
 export interface TaskFile {
   id: string;
