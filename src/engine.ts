@@ -5,6 +5,7 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { parseAgentFile, type ResolvedConfig } from "./config.js";
 import { runGate, type GateResult } from "./gate.js";
 import { realGit, mergeTicket, type Git } from "./git.js";
+import type { ProgressCallback, ProgressStage } from "./progress.js";
 import { ticketFiles, ticketWaves } from "./tickets.js";
 import type { ResumeStage } from "./resume.js";
 import type { RpcClient, SubagentInfo } from "./rpc.js";
@@ -33,6 +34,7 @@ export interface EngineDeps {
   cwd: string;
   boardDir: string;
   config: ResolvedConfig;
+  onProgress?: ProgressCallback;
   git?: Git;
   agentDir?: string;
   gate?: (testCommand: string | undefined, cwd: string, timeoutMs?: number) => Promise<GateResult>;
@@ -296,6 +298,12 @@ export async function runSmallFlow(
     let rounds = 0;
     // A human-initiated resume gets a fresh fix budget.
     let fixRoundsUsed = 0;
+    const emit = (stage: ProgressStage, activeRole?: string) => {
+      deps.onProgress?.({
+        runId, taskId: task.id, stage, ...(activeRole !== undefined && { activeRole }),
+        rounds, fixRoundsUsed, fixBudget: config.fixBudget,
+      });
+    };
     let startAt = opts.startAt;
     let gatePassed = false;
     let qaEvidence = "";
@@ -328,6 +336,7 @@ export async function runSmallFlow(
       });
       if (name === "coder") rounds++;
       try {
+        emit(name, name);
         await patchLock(boardDir, { currentAgentId: id, currentRoles: [name] }, runId);
       } catch (error) {
         await rpc.stop(id).catch(() => {});
@@ -388,6 +397,7 @@ export async function runSmallFlow(
 
       const { testCommand } = parseTaskFile(taskFile, await readTask());
       signal?.throwIfAborted();
+      emit("gate");
       const result = await gate(testCommand, deps.cwd);
       signal?.throwIfAborted();
       gatePassed = result.passed;
@@ -525,6 +535,12 @@ export async function runBigFlow(
     let rounds = 0;
     // A human-initiated resume gets a fresh fix budget.
     let fixRoundsUsed = 0;
+    const emit = (stage: ProgressStage, activeRole?: string) => {
+      deps.onProgress?.({
+        runId, taskId: task.id, stage, ...(activeRole !== undefined && { activeRole }),
+        rounds, fixRoundsUsed, fixBudget: config.fixBudget,
+      });
+    };
     let startAt = opts.startAt ?? "architect";
     const planTickets = task.parallel && (startAt === "architect" || startAt === "coder");
     let gatePassed = false;
@@ -571,6 +587,7 @@ export async function runBigFlow(
       });
       if (name === "coder") rounds++;
       try {
+        emit(name, name);
         if (ticketId) {
           await withBoard(boardDir, async () => {
             const current = await requireLock(boardDir, runId);
@@ -758,6 +775,7 @@ export async function runBigFlow(
       } else {
         const { testCommand } = parseTaskFile(taskFile, await readTask());
         signal?.throwIfAborted();
+        emit("gate");
         const result = await gate(testCommand, deps.cwd);
         signal?.throwIfAborted();
         gatePassed = result.passed;

@@ -56,7 +56,7 @@ the last completed board stage instead of redoing finished work.
   path was also checked live (`/team resume` on 通过 T-004 →
   "is not interrupted"). P3-1 is fully done (code + live).
 
-## P3-2: progress widget (next)
+## P3-2: progress widget — DONE (2026-11-25, implementation + tests; live TUI check pending)
 
 Live TUI progress during `/team run`: role, stage, fix rounds used.
 API verified in the installed Pi 1.5.2 types
@@ -70,6 +70,27 @@ active role, fixRoundsUsed); the extension renders it into the widget in
 interactive mode and clears it when the run ends. Print mode keeps the
 text report (no widget there). Tests: callback invocation per stage +
 widget content formatting; live check needs an interactive Pi session.
+
+Implementation: new `src/progress.ts` (`RunProgress`, `formatProgressLines`
+— two lines: `pi-team ${taskId} — ${stage}` and
+`agent: ${role} · fix ${used}/${budget} · round ${n}`). The engine emits
+from the `agent()` helper right after each spawn (so resume entries are
+correct with no special-casing) and before each gate call; no `done`
+event — the extension clears the widget in the `finally` block. The
+widget updates only when `ctx.mode === "tui"` (`ExtensionMode` is
+`"tui" | "rpc" | "json" | "print"`; the type docs say to guard
+terminal-only UI with `"tui"`). Both `run` and `resume` wire the same
+callback. Tests: 129/129 (was 124, +5 progress tests incl. event
+sequences for small/big flows, fix-round counters, resume-from-verify
+first event `gate`). tsc strict clean. This time the Codex diff applied
+cleanly on the first check (the P3-1 empty-line warning in the brief
+worked).
+
+Live verification: NOT done yet — needs an interactive (TUI) Pi session;
+print mode is unchanged by construction (widget gated on `"tui"`) and the
+engine emit path is unit-tested. Attempt a PTY check (`script -qec`,
+run `/team run` in the TUI, look for the widget lines in the terminal
+capture). Needs a working Llmapi key for the run itself.
 
 ## P3-3: interactive `team_dispatch` (after the widget)
 

@@ -10,6 +10,7 @@ import {
 import { resolveConfig } from "../src/config.js";
 import { runConfiguredFlow, stopRun, type RunSummary } from "../src/engine.js";
 import { initTeam, type InitReport } from "../src/init.js";
+import { formatProgressLines, type RunProgress } from "../src/progress.js";
 import { deliverReport, notify } from "../src/report.js";
 import { resumeFlow } from "../src/resume.js";
 import { formatRolesTable } from "../src/roles.js";
@@ -78,8 +79,14 @@ export default function teamExtension(pi: ExtensionAPI): void {
     description: "Multi-role coding team: init | roles | run <task-file> | resume <task-file> | status | stop",
     getArgumentCompletions,
     async handler(args: string, ctx: ExtensionCommandContext): Promise<void> {
-      const [sub, ...rest] = args.trim().split(/\s+/).filter(Boolean);
+      const [sub, taskFile] = args.trim().split(/\s+/).filter(Boolean);
       const opts = { projectDir: ctx.cwd, packageDir, agentDir };
+      const updateProgress = (progress: RunProgress) => {
+        ctx.ui.setStatus("pi-team", `running ${taskFile}… ${progress.stage}`);
+        if (ctx.mode === "tui") {
+          ctx.ui.setWidget("pi-team", formatProgressLines(progress), { placement: "aboveEditor" });
+        }
+      };
       try {
         switch (sub) {
           case "init": {
@@ -95,7 +102,6 @@ export default function teamExtension(pi: ExtensionAPI): void {
             return;
           }
           case "run": {
-            const taskFile = rest[0];
             if (!taskFile) {
               notify(ctx.mode, ctx.ui, "Usage: /team run <task-file>", "error");
               return;
@@ -106,17 +112,17 @@ export default function teamExtension(pi: ExtensionAPI): void {
             ctx.ui.setStatus("pi-team", `running ${taskFile}…`);
             try {
               const summary = await runConfiguredFlow(
-                { rpc, cwd: ctx.cwd, boardDir, config, agentDir },
+                { rpc, cwd: ctx.cwd, boardDir, config, agentDir, onProgress: updateProgress },
                 { taskFile, signal: ctx.signal },
               );
               sendReport(pi, ctx.mode, formatRunSummary(summary));
             } finally {
               ctx.ui.setStatus("pi-team", undefined);
+              if (ctx.mode === "tui") ctx.ui.setWidget("pi-team", undefined);
             }
             return;
           }
           case "resume": {
-            const taskFile = rest[0];
             if (!taskFile) {
               notify(ctx.mode, ctx.ui, "Usage: /team resume <task-file>", "error");
               return;
@@ -127,12 +133,13 @@ export default function teamExtension(pi: ExtensionAPI): void {
             ctx.ui.setStatus("pi-team", `resuming ${taskFile}…`);
             try {
               const summary = await resumeFlow(
-                { rpc, cwd: ctx.cwd, boardDir, config, agentDir },
+                { rpc, cwd: ctx.cwd, boardDir, config, agentDir, onProgress: updateProgress },
                 { taskFile, signal: ctx.signal },
               );
               sendReport(pi, ctx.mode, formatRunSummary(summary));
             } finally {
               ctx.ui.setStatus("pi-team", undefined);
+              if (ctx.mode === "tui") ctx.ui.setWidget("pi-team", undefined);
             }
             return;
           }
