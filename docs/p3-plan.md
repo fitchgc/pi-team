@@ -44,11 +44,17 @@ the last completed board stage instead of redoing finished work.
   counts) plus bare empty lines git rejects — repaired by normalizing the
   empty lines and recomputing the headers; only two header numbers changed,
   content untouched. One test-only type fix by hand (stub `git` needed the
-  `timedOut` field). Live verification: NOT done yet — needs a working
-  Llmapi key (john is disabling the VM key used for P2-4/T-004/P2-5).
-  Paths to check live: interrupt a run mid-flight (`/team stop`), then
-  `/team resume` and confirm it continues from the last completed stage
-  instead of restarting.
+  `timedOut` field). Live verification: DONE 2026-11-25, key still live
+  at the time. T-008 (isOdd) in pi-team-fresh: started a run, `/team
+  stop` at ~75s (status 已中断, 接口设计 + 实现记录 present, no 验收结论),
+  then `/team resume` → 通过 in 27s with `rounds: 0` (no coder spawned —
+  the resume entered at verify as designed), the 接口设计 section
+  byte-identical (md5 754a14fd… unchanged, architect did not re-run),
+  the original coder record kept, QA + reviewer ran, 15 tests pass.
+  The stopped run's own process exited with "no longer owns the lock"
+  (expected — the stop removed the lock). The non-interrupted error
+  path was also checked live (`/team resume` on 通过 T-004 →
+  "is not interrupted"). P3-1 is fully done (code + live).
 
 ## P3-2: progress widget (next)
 
