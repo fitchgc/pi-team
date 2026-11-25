@@ -11,16 +11,18 @@ import { resolveConfig } from "../src/config.js";
 import { runConfiguredFlow, stopRun, type RunSummary } from "../src/engine.js";
 import { initTeam, type InitReport } from "../src/init.js";
 import { deliverReport, notify } from "../src/report.js";
+import { resumeFlow } from "../src/resume.js";
 import { formatRolesTable } from "../src/roles.js";
 import { RpcClient } from "../src/rpc.js";
 import { formatRunStatus, getRunStatus } from "../src/status.js";
 
 const packageDir = dirname(dirname(fileURLToPath(import.meta.url)));
-const usage = "Usage: /team init | roles | run <task-file> | status | stop";
+const usage = "Usage: /team init | roles | run <task-file> | resume <task-file> | status | stop";
 const completions = [
   { value: "init", label: "init", description: "Create the project board, agents, and skills" },
   { value: "roles", label: "roles", description: "Show the effective role definitions" },
   { value: "run", label: "run", description: "Run the team on a task file" },
+  { value: "resume", label: "resume", description: "Resume an interrupted run from the last completed stage" },
   { value: "status", label: "status", description: "Show the active run status" },
   { value: "stop", label: "stop", description: "Stop the active team run" },
 ];
@@ -73,7 +75,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
   };
 
   pi.registerCommand("team", {
-    description: "Multi-role coding team: init | roles | run <task-file> | status | stop",
+    description: "Multi-role coding team: init | roles | run <task-file> | resume <task-file> | status | stop",
     getArgumentCompletions,
     async handler(args: string, ctx: ExtensionCommandContext): Promise<void> {
       const [sub, ...rest] = args.trim().split(/\s+/).filter(Boolean);
@@ -104,6 +106,27 @@ export default function teamExtension(pi: ExtensionAPI): void {
             ctx.ui.setStatus("pi-team", `running ${taskFile}…`);
             try {
               const summary = await runConfiguredFlow(
+                { rpc, cwd: ctx.cwd, boardDir, config, agentDir },
+                { taskFile, signal: ctx.signal },
+              );
+              sendReport(pi, ctx.mode, formatRunSummary(summary));
+            } finally {
+              ctx.ui.setStatus("pi-team", undefined);
+            }
+            return;
+          }
+          case "resume": {
+            const taskFile = rest[0];
+            if (!taskFile) {
+              notify(ctx.mode, ctx.ui, "Usage: /team resume <task-file>", "error");
+              return;
+            }
+            const config = await resolveConfig(opts);
+            const boardDir = join(ctx.cwd, config.board);
+            const rpc = new RpcClient(bus);
+            ctx.ui.setStatus("pi-team", `resuming ${taskFile}…`);
+            try {
+              const summary = await resumeFlow(
                 { rpc, cwd: ctx.cwd, boardDir, config, agentDir },
                 { taskFile, signal: ctx.signal },
               );

@@ -6,6 +6,7 @@ import { parseAgentFile, type ResolvedConfig } from "./config.js";
 import { runGate, type GateResult } from "./gate.js";
 import { realGit, mergeTicket, type Git } from "./git.js";
 import { ticketFiles, ticketWaves } from "./tickets.js";
+import type { ResumeStage } from "./resume.js";
 import type { RpcClient, SubagentInfo } from "./rpc.js";
 import {
   getSection,
@@ -181,7 +182,7 @@ function checkInside(boardDir: string, path: string): void {
   }
 }
 
-async function taskPath(boardDir: string, filename: string): Promise<string> {
+export async function taskPath(boardDir: string, filename: string): Promise<string> {
   const root = resolve(boardDir);
   const path = resolve(root, filename);
   checkInside(root, path);
@@ -270,9 +271,17 @@ function isAbort(error: unknown): boolean {
     && (error.name === "AbortError" || /abort/i.test(error.message)));
 }
 
+function passingBoardConclusion(id: string, text: string) {
+  const conclusion = parseVerdict(getSection(text, "验收结论") ?? "");
+  if (conclusion?.verdict !== "通过") {
+    throw new Error(`cannot resume task ${id}: 验收结论 is not a passing verdict`);
+  }
+  return conclusion;
+}
+
 export async function runSmallFlow(
   deps: EngineDeps,
-  opts: { taskFile: string; signal?: AbortSignal },
+  opts: { taskFile: string; signal?: AbortSignal; startAt?: ResumeStage },
 ): Promise<RunSummary> {
   const { boardDir, rpc, config } = deps;
   const { taskFile, signal } = opts;
@@ -285,7 +294,9 @@ export async function runSmallFlow(
   const { runId } = await acquireRunLock(boardDir, task.id);
   try {
     let rounds = 0;
+    // A human-initiated resume gets a fresh fix budget.
     let fixRoundsUsed = 0;
+    let startAt = opts.startAt;
     let gatePassed = false;
     let qaEvidence = "";
 
@@ -347,22 +358,34 @@ export async function runSmallFlow(
     await rpc.ensureProtocol();
     const gate = deps.gate ?? runGate;
 
+    if (startAt === "auditor") {
+      const conclusion = passingBoardConclusion(task.id, text);
+      gatePassed = true;
+      qaEvidence = conclusion.evidence;
+      const status = await finishWithSecurityAudit(config, taskFile, agent, edit,
+        fresh => updateConclusion(fresh, conclusion));
+      return summary(status, status === "打回", status === "打回" ? "security audit rejected" : undefined);
+    }
+
     for (;;) {
       if (fixRoundsUsed > 0) text = await readTask();
       gatePassed = false;
       qaEvidence = "";
-      const coder = await agent("coder", coderPrompt(taskFile, text, fixRoundsUsed > 0));
-      if (coder.info.status !== "completed") {
-        const failure = `coder agent ${coder.info.status}: ${coder.info.error || "(no error)"}`;
-        await edit((fresh) => interrupted(fresh, failure));
-        return summary("已中断");
+      if (startAt !== "verify") {
+        const coder = await agent("coder", coderPrompt(taskFile, text, fixRoundsUsed > 0));
+        if (coder.info.status !== "completed") {
+          const failure = `coder agent ${coder.info.status}: ${coder.info.error || "(no error)"}`;
+          await edit((fresh) => interrupted(fresh, failure));
+          return summary("已中断");
+        }
+
+        const record = [
+          `coder ${coder.id} (${coder.info.durationMs}ms, ${coder.info.toolUses} tool uses):`,
+          coder.info.result || "(no result text)",
+        ].join("\n");
+        await edit((fresh) => updateStatus(updateSection(fresh, "实现记录", record), "待验收"));
       }
 
-      const record = [
-        `coder ${coder.id} (${coder.info.durationMs}ms, ${coder.info.toolUses} tool uses):`,
-        coder.info.result || "(no result text)",
-      ].join("\n");
-      await edit((fresh) => updateStatus(updateSection(fresh, "实现记录", record), "待验收"));
       const { testCommand } = parseTaskFile(taskFile, await readTask());
       signal?.throwIfAborted();
       const result = await gate(testCommand, deps.cwd);
@@ -403,6 +426,7 @@ export async function runSmallFlow(
         return summary("打回", true, `fix budget exhausted after ${fixRoundsUsed} fix rounds`);
       }
       fixRoundsUsed++;
+      startAt = undefined;
       await patchLock(boardDir, { fixRoundsUsed }, runId);
       await edit((fresh) => updateStatus(conclude(fresh), "实现中"));
     }
@@ -445,17 +469,21 @@ function auditorPrompt(text: string): string {
   ].join("\n");
 }
 
+export function needsSecurityAudit(config: ResolvedConfig, labels?: string[]): boolean {
+  const { trigger, label } = config.securityAudit;
+  return config.roles["security-auditor"].enabled === true && (trigger === "always"
+    || (trigger === "label" && labels?.includes(label) === true));
+}
+
 async function finishWithSecurityAudit(
   config: ResolvedConfig, taskFile: string,
   agent: (name: "security-auditor", prompt: string) => Promise<{ info: SubagentInfo } | undefined>,
   edit: (mutate: (text: string) => string) => Promise<string>,
   conclude: (text: string) => string,
 ): Promise<RunSummary["status"]> {
-  const { trigger, label } = config.securityAudit;
   let auditRequired = false;
   const text = await edit((fresh) => {
-    auditRequired = config.roles["security-auditor"].enabled === true && (trigger === "always"
-      || (trigger === "label" && parseTaskFile(taskFile, fresh).labels?.includes(label) === true));
+    auditRequired = needsSecurityAudit(config, parseTaskFile(taskFile, fresh).labels);
     const concluded = conclude(fresh);
     return auditRequired ? concluded : updateStatus(concluded, "通过");
   });
@@ -482,7 +510,7 @@ async function finishWithSecurityAudit(
 
 export async function runBigFlow(
   deps: EngineDeps,
-  opts: { taskFile: string; signal?: AbortSignal },
+  opts: { taskFile: string; signal?: AbortSignal; startAt?: ResumeStage },
 ): Promise<RunSummary> {
   const { boardDir, rpc, config } = deps;
   const { taskFile, signal } = opts;
@@ -495,7 +523,10 @@ export async function runBigFlow(
   const { runId } = await acquireRunLock(boardDir, task.id);
   try {
     let rounds = 0;
+    // A human-initiated resume gets a fresh fix budget.
     let fixRoundsUsed = 0;
+    let startAt = opts.startAt ?? "architect";
+    const planTickets = task.parallel && (startAt === "architect" || startAt === "coder");
     let gatePassed = false;
     let qaEvidence = "";
 
@@ -585,7 +616,7 @@ export async function runBigFlow(
 
     signal?.throwIfAborted();
     const git = (args: string[]) => (deps.git ?? realGit)(args, deps.cwd);
-    if (task.parallel) {
+    if (planTickets) {
       const isolation = config.roles.coder.isolation;
       if (isolation !== undefined && isolation !== "worktree") {
         throw new Error(`parallel coder isolation must be worktree; got ${isolation}`);
@@ -629,7 +660,10 @@ export async function runBigFlow(
     const gate = deps.gate ?? runGate;
 
     let designPrompt = "";
-    if (config.roles.architect.enabled) {
+    if (startAt !== "architect") {
+      const design = getSection(text, "接口设计");
+      if (design && design !== "architect disabled; skipped") designPrompt = `## 接口设计\n${design}\n\n`;
+    } else if (config.roles.architect.enabled) {
       const architect = await agent("architect", [
         taskBrief(taskFile, text),
         "Design the shared interfaces and module boundaries. Do not modify any files.",
@@ -643,7 +677,7 @@ export async function runBigFlow(
       text = await edit((fresh) => updateSection(fresh, "接口设计", "architect disabled; skipped"));
     }
 
-    if (task.parallel) {
+    if (planTickets) {
       const before = await ticketFiles(boardDir, task.id);
       const planner = await agent("planner", [
         taskBrief(taskFile, text), designPrompt,
@@ -703,7 +737,8 @@ export async function runBigFlow(
       if (fixRoundsUsed > 0) text = await readTask();
       gatePassed = false;
       qaEvidence = "";
-      if (!task.parallel || fixRoundsUsed > 0) {
+      const codeThisPass = startAt === "architect" || startAt === "coder";
+      if (codeThisPass && (!task.parallel || fixRoundsUsed > 0)) {
         const prompt = coderPrompt(taskFile, text, fixRoundsUsed > 0, fixSection);
         const coder = await agent("coder", designPrompt + prompt);
         if (!coder) return summary("已中断");
@@ -716,35 +751,42 @@ export async function runBigFlow(
           task.parallel ? appendRecord(fresh, record) : updateSection(fresh, "实现记录", record), "待验收",
         ));
       }
-      const { testCommand } = parseTaskFile(taskFile, await readTask());
-      signal?.throwIfAborted();
-      const result = await gate(testCommand, deps.cwd);
-      signal?.throwIfAborted();
-      gatePassed = result.passed;
-
       let conclusion: NonNullable<ReturnType<typeof parseVerdict>>;
-      if (!gatePassed) {
-        conclusion = {
-          verdict: "打回",
-          evidence: result.output,
-          reasons: `gate failed: ${testCommand}\n${result.output}`,
-        };
+      if (startAt === "reviewer" || startAt === "auditor") {
+        conclusion = passingBoardConclusion(task.id, text);
+        gatePassed = true;
       } else {
-        const qa = await agent("qa", designPrompt + qaPrompt(taskFile, await readTask()));
-        if (!qa) return summary("已中断");
-        const reply = qa.info.result ?? "";
-        conclusion = parseVerdict(reply) ?? {
-          verdict: "打回",
-          evidence: reply || "(no result text)",
-          reasons: "QA returned no parseable verdict",
-        };
+        const { testCommand } = parseTaskFile(taskFile, await readTask());
+        signal?.throwIfAborted();
+        const result = await gate(testCommand, deps.cwd);
+        signal?.throwIfAborted();
+        gatePassed = result.passed;
+        if (!gatePassed) {
+          conclusion = {
+            verdict: "打回",
+            evidence: result.output,
+            reasons: `gate failed: ${testCommand}\n${result.output}`,
+          };
+        } else {
+          const qa = await agent("qa", designPrompt + qaPrompt(taskFile, await readTask()));
+          if (!qa) return summary("已中断");
+          const reply = qa.info.result ?? "";
+          conclusion = parseVerdict(reply) ?? {
+            verdict: "打回",
+            evidence: reply || "(no result text)",
+            reasons: "QA returned no parseable verdict",
+          };
+        }
       }
 
       qaEvidence = conclusion.evidence;
       let conclude = (fresh: string) => updateConclusion(fresh, conclusion);
       let passed = conclusion.verdict === "通过";
       fixSection = "验收结论";
-      if (passed && config.roles.reviewer.enabled) {
+      if (startAt === "auditor") {
+        const report = getSection(text, "评审结论");
+        if (report) conclude = fresh => updateSection(fresh, "评审结论", report);
+      } else if (passed && config.roles.reviewer.enabled) {
         text = await edit(conclude);
         const reviewer = await agent("reviewer", reviewerPrompt(text));
         if (!reviewer) return summary("已中断");
@@ -767,6 +809,7 @@ export async function runBigFlow(
         return summary("打回", true, `fix budget exhausted after ${fixRoundsUsed} fix rounds`);
       }
       fixRoundsUsed++;
+      startAt = "coder";
       await patchLock(boardDir, { fixRoundsUsed }, runId);
       await edit((fresh) => updateStatus(conclude(fresh), "实现中"));
     }
@@ -789,7 +832,7 @@ export async function runBigFlow(
 
 export function runConfiguredFlow(
   deps: EngineDeps,
-  opts: { taskFile: string; signal?: AbortSignal },
+  opts: { taskFile: string; signal?: AbortSignal; startAt?: ResumeStage },
 ): Promise<RunSummary> {
   const run = deps.config.defaultFlow === "big" ? runBigFlow : runSmallFlow;
   return run(deps, opts);
