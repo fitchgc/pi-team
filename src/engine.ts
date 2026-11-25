@@ -22,6 +22,8 @@ export interface RunLock {
   startedAt: number;
   currentAgentId?: string;
   currentAgentIds?: string[];
+  currentRoles?: string[];
+  fixRoundsUsed?: number;
   taskFile?: string;
 }
 
@@ -80,6 +82,10 @@ function isRunLock(value: unknown): value is RunLock {
     && "taskId" in value && typeof value.taskId === "string" && value.taskId.length > 0
     && "startedAt" in value && typeof value.startedAt === "number" && Number.isFinite(value.startedAt)
     && (!("taskFile" in value) || typeof value.taskFile === "string")
+    && (!("fixRoundsUsed" in value) || (typeof value.fixRoundsUsed === "number"
+      && Number.isFinite(value.fixRoundsUsed) && value.fixRoundsUsed >= 0))
+    && (!("currentRoles" in value) || (Array.isArray(value.currentRoles)
+      && value.currentRoles.every(role => typeof role === "string" && role.length > 0)))
     && (!("currentAgentIds" in value) || (Array.isArray(value.currentAgentIds)
       && value.currentAgentIds.every(id => typeof id === "string" && id.length > 0)))
     && (!("currentAgentId" in value) || typeof value.currentAgentId === "string");
@@ -311,7 +317,7 @@ export async function runSmallFlow(
       });
       if (name === "coder") rounds++;
       try {
-        await patchLock(boardDir, { currentAgentId: id }, runId);
+        await patchLock(boardDir, { currentAgentId: id, currentRoles: [name] }, runId);
       } catch (error) {
         await rpc.stop(id).catch(() => {});
         throw error;
@@ -322,6 +328,7 @@ export async function runSmallFlow(
       await withBoard(boardDir, async () => {
         const current = await requireLock(boardDir, runId);
         delete current.currentAgentId;
+        delete current.currentRoles;
         await writeFile(lockPath(boardDir), JSON.stringify(current));
       });
       return { id, info };
@@ -396,6 +403,7 @@ export async function runSmallFlow(
         return summary("打回", true, `fix budget exhausted after ${fixRoundsUsed} fix rounds`);
       }
       fixRoundsUsed++;
+      await patchLock(boardDir, { fixRoundsUsed }, runId);
       await edit((fresh) => updateStatus(conclude(fresh), "实现中"));
     }
   } catch (error) {
@@ -537,10 +545,11 @@ export async function runBigFlow(
             const current = await requireLock(boardDir, runId);
             waitSignal?.throwIfAborted();
             (current.currentAgentIds ??= []).push(id);
+            (current.currentRoles ??= []).push("coder");
             await writeFile(lockPath(boardDir), JSON.stringify(current));
           });
         } else {
-          await patchLock(boardDir, { currentAgentId: id }, runId);
+          await patchLock(boardDir, { currentAgentId: id, currentRoles: [name] }, runId);
         }
       } catch (error) {
         await rpc.stop(id).catch(() => {});
@@ -552,10 +561,16 @@ export async function runBigFlow(
       await withBoard(boardDir, async () => {
         const current = await requireLock(boardDir, runId);
         if (ticketId) {
+          const index = current.currentAgentIds?.indexOf(id) ?? -1;
           current.currentAgentIds = current.currentAgentIds?.filter(active => active !== id);
-          if (!current.currentAgentIds?.length) delete current.currentAgentIds;
+          if (index >= 0) current.currentRoles?.splice(index, 1);
+          if (!current.currentAgentIds?.length) {
+            delete current.currentAgentIds;
+            delete current.currentRoles;
+          }
         } else {
           delete current.currentAgentId;
+          delete current.currentRoles;
         }
         await writeFile(lockPath(boardDir), JSON.stringify(current));
       });
@@ -659,6 +674,7 @@ export async function runBigFlow(
             if (lock?.runId !== runId) return;
             await stopAgents(rpc, lock);
             delete lock.currentAgentIds;
+            delete lock.currentRoles;
             await writeFile(lockPath(boardDir), JSON.stringify(lock));
           });
           await Promise.allSettled(jobs);
@@ -751,6 +767,7 @@ export async function runBigFlow(
         return summary("打回", true, `fix budget exhausted after ${fixRoundsUsed} fix rounds`);
       }
       fixRoundsUsed++;
+      await patchLock(boardDir, { fixRoundsUsed }, runId);
       await edit((fresh) => updateStatus(conclude(fresh), "实现中"));
     }
   } catch (error) {

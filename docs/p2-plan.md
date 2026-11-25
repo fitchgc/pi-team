@@ -87,31 +87,84 @@ within budget; budget exhaustion stops and escalates.
 Open question: reviewer after QA only, or also a design review after the
 architect step?
 
-### P2-4: Security auditor trigger
+### P2-4: Security auditor trigger — DONE (2026-11-25, commit 8fe060d, pushed)
 
 Scope: when the task file carries the `security-sensitive` label (or the
 config trigger is `always`), run the security auditor; a rejection stops the
 run and escalates to the user with no auto-fix loop. `never` disables it.
 The `securityAudit` config (trigger + label) already exists in v0.1.
 
-Files: `src/engine.ts`.
+Position decision (taken 2026-11-25, was the plan's open question): the
+auditor runs AFTER the reviewer passes (big flow) and after QA passes
+(small flow), as the final gate before marking 通过 — never twice.
+Labels come from a task-file header line `- 标签：a, b`. A rejection
+writes the report to a `安全审计` board section and returns 打回 +
+escalated with no fix round and no budget consumption; an unparseable
+verdict and an auditor agent failure are handled the same way (the
+failure interrupts the run instead).
 
-Acceptance: a labeled task triggers the audit; a rejection stops the run and
-escalates; an unlabeled task skips it.
+Live verification (2026-11-25, pi-team-fresh T-004 `isSafeRedirect`,
+labeled security-sensitive): architect → coder → gate → QA 通过 →
+reviewer 通过 → auditor 打回 on a REAL finding — `/\evil.example`
+passes the `/` prefix check but browsers may treat the backslash as a
+slash, making it a protocol-relative external URL (open redirect). The
+reviewer had only hinted at the same risk as a suggestion; the auditor
+made it blocking. Task ended 打回 + escalated, fixRoundsUsed 0, no
+coder re-spawn. The pass path is covered by unit tests only (106/106);
+a live 通过 via the auditor is still unproven.
 
-Open question: auditor after QA, after reviewer, or both?
+Follow-up fix found by the live run: `extensions/team.ts` hardcoded
+"escalated: fix budget exhausted — needs a human" for every escalation.
+`RunSummary` now carries `escalationReason` (budget exhaustion, security
+audit rejected, parallel merge conflict) and the report renders the real
+cause. The `summary()` closures omit the key when no reason is set, so
+existing deepEqual test expectations still pass.
 
-### P2-5: `/team status`
+Files: `src/engine.ts`, `src/taskfile.ts`, `test/engine.test.ts`,
+`extensions/team.ts`.
+
+Live-run blocker found the same morning (NOT a pi-team bug): both
+`/team run` attempts stalled ~25–30 min with zero board progress, and
+bare `pi -p` probes hung the same way. Root cause was the launch, not
+the key: `pi -p` waits on stdin when stdin is an open pipe with no EOF
+(the exec runtime's stdin). Fix: always add `< /dev/null` to Pi
+invocations (see TOOLS.md). The IP allowlist was suspected first
+(egress changed after the 07:40 VM replacement) and john removed the
+restriction, but the stdin fix is what unblocked it — whether the stale
+allowlist (172.18.0.1) would also have blocked is unproven.
+
+### P2-5: `/team status` — DONE (2026-11-25, implementation + tests; live check pending a key)
 
 Scope: text report of the active run — run id, task, started time, per-role
 state, fixBudget remaining. Reads the run lock + board state. A live status
 widget is P3, not this unit.
 
-Files: `extensions/team.ts`, new `src/status.ts` if the formatting grows.
+Files: `extensions/team.ts`, new `src/status.ts` (`getRunStatus` +
+`formatRunStatus`). Lock gains two optional fields: `fixRoundsUsed`
+(patched after each increment in both flows) and `currentRoles`
+(maintained alongside the agent ids at the same write points, so the
+status report can name the active role; pre-change locks report
+`"unknown"` for a single agent and `"coder"` for parallel ids).
+Per-role completion is derived from board sections: 接口设计 / 实现记录 /
+验收结论 / 评审结论 / 安全审计. `formatRunStatus` shows start time +
+elapsed, stages as done/pending, active agents, fix budget remaining
+(clamped at 0). Missing task file does not throw (title undefined, all
+stages pending). Command mirrors `stop`: no lock → notify
+"no pi-team run is active".
 
 Acceptance: `/team status` prints the active run while a run is in flight
 and "no active run" otherwise. Mostly independent of the other units (the
 run lock already exists in v0.1).
+
+Tests: 113/113 (was 106, +7 status tests incl. the engine persisting
+`fixRoundsUsed === 2` after two QA rejections). tsc strict clean.
+
+Live verification: NOT done yet — needs a working Llmapi key (john is
+disabling the VM key used for P2-4/T-004). Two paths to check live:
+(1) no-run path: `/team status` in a project with no active run;
+(2) active-run path: start a `/team run`, call `/team status` mid-flight,
+then `/team stop`. P2 is code-complete with this unit; P2-5's live check
+is the only open item.
 
 ## Order
 

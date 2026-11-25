@@ -13,13 +13,15 @@ import { initTeam, type InitReport } from "../src/init.js";
 import { deliverReport, notify } from "../src/report.js";
 import { formatRolesTable } from "../src/roles.js";
 import { RpcClient } from "../src/rpc.js";
+import { formatRunStatus, getRunStatus } from "../src/status.js";
 
 const packageDir = dirname(dirname(fileURLToPath(import.meta.url)));
-const usage = "Usage: /team init | roles | run <task-file> | stop";
+const usage = "Usage: /team init | roles | run <task-file> | status | stop";
 const completions = [
   { value: "init", label: "init", description: "Create the project board, agents, and skills" },
   { value: "roles", label: "roles", description: "Show the effective role definitions" },
   { value: "run", label: "run", description: "Run the team on a task file" },
+  { value: "status", label: "status", description: "Show the active run status" },
   { value: "stop", label: "stop", description: "Stop the active team run" },
 ];
 
@@ -71,7 +73,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
   };
 
   pi.registerCommand("team", {
-    description: "Multi-role coding team: init | roles | run <task-file> | stop",
+    description: "Multi-role coding team: init | roles | run <task-file> | status | stop",
     getArgumentCompletions,
     async handler(args: string, ctx: ExtensionCommandContext): Promise<void> {
       const [sub, ...rest] = args.trim().split(/\s+/).filter(Boolean);
@@ -108,6 +110,16 @@ export default function teamExtension(pi: ExtensionAPI): void {
               sendReport(pi, ctx.mode, formatRunSummary(summary));
             } finally {
               ctx.ui.setStatus("pi-team", undefined);
+            }
+            return;
+          }
+          case "status": {
+            const config = await resolveConfig(opts);
+            const status = await getRunStatus({ boardDir: join(ctx.cwd, config.board), config });
+            if (status === undefined) {
+              notify(ctx.mode, ctx.ui, "no pi-team run is active", "info");
+            } else {
+              sendReport(pi, ctx.mode, formatRunStatus(status));
             }
             return;
           }
