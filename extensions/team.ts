@@ -54,7 +54,11 @@ function formatRunSummary(summary: RunSummary): string {
     `Task ${summary.taskId}: ${summary.status}`,
     `rounds: ${summary.rounds}, fix rounds used: ${summary.fixRoundsUsed}, gate passed: ${gate}, QA evidence: ${summary.qaEvidence}`,
   ];
-  if (summary.escalated) lines.push("escalated: fix budget exhausted — needs a human");
+  if (summary.escalated) {
+    lines.push(summary.escalationReason
+      ? `escalated: ${summary.escalationReason} — needs a human`
+      : "escalated: needs a human");
+  }
   return lines.join("\n");
 }
 

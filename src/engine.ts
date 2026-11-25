@@ -6,7 +6,7 @@ import { parseAgentFile, type ResolvedConfig } from "./config.js";
 import { runGate, type GateResult } from "./gate.js";
 import { realGit, mergeTicket, type Git } from "./git.js";
 import { ticketFiles, ticketWaves } from "./tickets.js";
-import type { RpcClient } from "./rpc.js";
+import type { RpcClient, SubagentInfo } from "./rpc.js";
 import {
   getSection,
   parseTaskFile,
@@ -42,6 +42,7 @@ export interface RunSummary {
   rounds: number;
   fixRoundsUsed: number;
   escalated: boolean;
+  escalationReason?: string;
   gatePassed: boolean;
   qaEvidence: string;
 }
@@ -282,8 +283,9 @@ export async function runSmallFlow(
     let gatePassed = false;
     let qaEvidence = "";
 
-    const summary = (status: RunSummary["status"], escalated = false): RunSummary => ({
+    const summary = (status: RunSummary["status"], escalated = false, escalationReason?: string): RunSummary => ({
       taskId: task.id, runId, status, rounds, fixRoundsUsed, escalated, gatePassed, qaEvidence,
+      ...(escalationReason !== undefined && { escalationReason }),
     });
 
     const edit = async (mutate: (text: string) => string): Promise<string> => {
@@ -296,7 +298,7 @@ export async function runSmallFlow(
       return text;
     };
 
-    const agent = async (name: "coder" | "qa", prompt: string) => {
+    const agent = async (name: "coder" | "qa" | "security-auditor", prompt: string) => {
       const role = config.roles[name];
       const lock = await readRunLock(boardDir);
       if (lock?.runId !== runId) throw new Error(`run ${runId} no longer owns the lock`);
@@ -385,13 +387,13 @@ export async function runSmallFlow(
       qaEvidence = conclusion.evidence;
       const conclude = (fresh: string) => updateConclusion(fresh, conclusion);
       if (conclusion.verdict === "通过") {
-        await edit((fresh) => updateStatus(conclude(fresh), "通过"));
-        return summary("通过");
+        const status = await finishWithSecurityAudit(config, taskFile, agent, edit, conclude);
+        return summary(status, status === "打回", status === "打回" ? "security audit rejected" : undefined);
       }
       if (fixRoundsUsed >= config.fixBudget) {
         const escalation = `fix budget exhausted after ${fixRoundsUsed} fix rounds; escalate to a human.`;
         await edit((fresh) => updateStatus(appendRecord(conclude(fresh), escalation), "打回"));
-        return summary("打回", true);
+        return summary("打回", true, `fix budget exhausted after ${fixRoundsUsed} fix rounds`);
       }
       fixRoundsUsed++;
       await edit((fresh) => updateStatus(conclude(fresh), "实现中"));
@@ -422,6 +424,54 @@ function reviewerPrompt(text: string): string {
   ].join("\n");
 }
 
+function auditorPrompt(text: string): string {
+  return [
+    text,
+    "Perform a read-only security review of the final implementation using the task and conclusions above.",
+    "Check authentication and authorization, secrets and credentials in code or logs, injection,",
+    "data exposure, unsafe dependency use, and error paths that leak internal details.",
+    "Do not modify any files. Start with exactly one of these verdict lines:",
+    "- verdict：通过",
+    "- verdict：打回",
+    "Follow the verdict with evidence and actionable reasons for any rejection.",
+  ].join("\n");
+}
+
+async function finishWithSecurityAudit(
+  config: ResolvedConfig, taskFile: string,
+  agent: (name: "security-auditor", prompt: string) => Promise<{ info: SubagentInfo } | undefined>,
+  edit: (mutate: (text: string) => string) => Promise<string>,
+  conclude: (text: string) => string,
+): Promise<RunSummary["status"]> {
+  const { trigger, label } = config.securityAudit;
+  let auditRequired = false;
+  const text = await edit((fresh) => {
+    auditRequired = config.roles["security-auditor"].enabled === true && (trigger === "always"
+      || (trigger === "label" && parseTaskFile(taskFile, fresh).labels?.includes(label) === true));
+    const concluded = conclude(fresh);
+    return auditRequired ? concluded : updateStatus(concluded, "通过");
+  });
+  if (!auditRequired) return "通过";
+
+  const auditor = await agent("security-auditor", auditorPrompt(text));
+  if (!auditor) return "已中断";
+  const { info } = auditor;
+  if (info.status !== "completed") {
+    const failure = `security-auditor agent ${info.status}: ${info.error || "(no error)"}`;
+    await edit((fresh) => interrupted(fresh, failure));
+    return "已中断";
+  }
+
+  const reply = (info.result || "(no result text)").replace(/^## /gm, "### ");
+  const verdict = parseVerdict(reply);
+  const report = verdict ? reply : [
+    "- verdict：打回", "- 打回原因：auditor returned no parseable verdict", reply,
+  ].join("\n");
+  const status = verdict?.verdict ?? "打回";
+  await edit((fresh) => updateStatus(updateSection(fresh, "安全审计", report), status));
+  return status;
+}
+
 export async function runBigFlow(
   deps: EngineDeps,
   opts: { taskFile: string; signal?: AbortSignal },
@@ -441,8 +491,9 @@ export async function runBigFlow(
     let gatePassed = false;
     let qaEvidence = "";
 
-    const summary = (status: RunSummary["status"], escalated = false): RunSummary => ({
+    const summary = (status: RunSummary["status"], escalated = false, escalationReason?: string): RunSummary => ({
       taskId: task.id, runId, status, rounds, fixRoundsUsed, escalated, gatePassed, qaEvidence,
+      ...(escalationReason !== undefined && { escalationReason }),
     });
 
     const edit = async (mutate: (text: string) => string): Promise<string> => {
@@ -456,7 +507,7 @@ export async function runBigFlow(
     };
 
     const agent = async (
-      name: "architect" | "planner" | "coder" | "qa" | "reviewer", prompt: string,
+      name: "architect" | "planner" | "coder" | "qa" | "reviewer" | "security-auditor", prompt: string,
       ticketId?: string, waitSignal = signal,
     ) => {
       const role = config.roles[name];
@@ -625,7 +676,7 @@ export async function runBigFlow(
             });
             return merge.escalated;
           });
-          if (escalated) return summary("打回", true);
+          if (escalated) return summary("打回", true, "parallel merge conflict");
         }
       }
       text = await edit(fresh => updateStatus(fresh, "待验收"));
@@ -691,13 +742,13 @@ export async function runBigFlow(
         fixSection = "评审结论";
       }
       if (passed) {
-        await edit((fresh) => updateStatus(conclude(fresh), "通过"));
-        return summary("通过");
+        const status = await finishWithSecurityAudit(config, taskFile, agent, edit, conclude);
+        return summary(status, status === "打回", status === "打回" ? "security audit rejected" : undefined);
       }
       if (fixRoundsUsed >= config.fixBudget) {
         const escalation = `fix budget exhausted after ${fixRoundsUsed} fix rounds; escalate to a human.`;
         await edit((fresh) => updateStatus(appendRecord(conclude(fresh), escalation), "打回"));
-        return summary("打回", true);
+        return summary("打回", true, `fix budget exhausted after ${fixRoundsUsed} fix rounds`);
       }
       fixRoundsUsed++;
       await edit((fresh) => updateStatus(conclude(fresh), "实现中"));

@@ -20,6 +20,7 @@ import {
   type EngineDeps,
 } from "../src/engine.js";
 import type { RpcClient, SpawnOptions, SubagentInfo } from "../src/rpc.js";
+import { getSection, parseTaskFile } from "../src/taskfile.js";
 
 interface SpawnCall {
   type: string;
@@ -98,7 +99,9 @@ const reject = "- verdict：打回\n- 证据：coverage incomplete\n- 打回原�
 
 async function fixture(
   context: TestContext,
-  { status = "待实现", command = "true" }: { status?: string; command?: string } = {},
+  { status = "待实现", command = "true", labels }: {
+    status?: string; command?: string; labels?: string;
+  } = {},
 ) {
   const cwd = await mkdtemp(join(tmpdir(), "pi-team-engine-"));
   context.after(() => rm(cwd, { recursive: true, force: true }));
@@ -112,6 +115,7 @@ async function fixture(
     "- 负责人：coder",
     "- 依赖：无",
     `- 测试命令：${command}`,
+    ...(labels === undefined ? [] : [`- 标签：${labels}`]),
     "",
     "## 需求",
     "Implement login.",
@@ -128,6 +132,91 @@ async function fixture(
   const deps: EngineDeps = { rpc: rpc as unknown as RpcClient, cwd, boardDir, config: config() };
   const run = (signal?: AbortSignal) => runSmallFlow(deps, { taskFile: filename, signal });
   return { deps, boardDir, path, rpc, run, text: () => readFile(path, "utf8") };
+}
+
+const auditPass = "- verdict：通过\n- 证据：authorization checks passed";
+
+function scriptAudit(rpc: FakeRpc, reply: string | Error) {
+  rpc.onWait = async (id) => {
+    const { type } = rpc.calls[Number(id.slice("agent-".length)) - 1];
+    if (type === "qa" || type === "reviewer") rpc.results.set(id, pass);
+    if (type !== "security-auditor") return;
+    if (reply instanceof Error) {
+      rpc.scripts.set(id, [{ ...completed(id, type), status: "error", error: reply.message }]);
+    } else {
+      rpc.results.set(id, reply);
+    }
+  };
+}
+
+test("only header labels are parsed, with either comma and no empty entries", () => {
+  const parse = (header: string) => parseTaskFile(filename, `${header}\r\n## 需求\r\n- 标签：ignored`);
+  assert.equal("labels" in parse(""), false);
+  assert.deepEqual(parse("- 标签： ， , ").labels, []);
+  assert.deepEqual(parse("- 标签： one, two ， three ").labels, ["one", "two", "three"]);
+});
+
+for (const [name, flow, labels, trigger, enabled, audited] of [
+  ["big labeled", runBigFlow, "security-sensitive", "label", true, true],
+  ["big unlabeled", runBigFlow, undefined, "label", true, false],
+  ["always on an unlabeled task", runBigFlow, undefined, "always", true, true],
+  ["never on a labeled task", runBigFlow, "security-sensitive", "never", true, false],
+  ["disabled role overrides always", runBigFlow, "security-sensitive", "always", false, false],
+  ["small labeled", runSmallFlow, "security-sensitive", "label", true, true],
+] as const) {
+  test(`security audit: ${name}`, async (context) => {
+    const { deps, rpc, text } = await fixture(context, { labels });
+    deps.config.securityAudit.trigger = trigger;
+    deps.config.roles["security-auditor"].enabled = enabled;
+    scriptAudit(rpc, auditPass);
+    const summary = await flow(deps, { taskFile: filename });
+    const board = await text();
+    assert.equal(summary.status, "通过");
+    assert.equal(parseTaskFile(filename, board).status, "通过");
+    const expected = flow === runBigFlow ? ["architect", "coder", "qa", "reviewer"] : ["coder", "qa"];
+    if (audited) expected.push("security-auditor");
+    assert.deepEqual(rpc.calls.map(call => call.type), expected);
+    assert.equal(getSection(board, "安全审计"), audited ? auditPass : undefined);
+    if (audited) {
+      const call = rpc.calls[rpc.calls.length - 1];
+      assert.equal(call.options?.isolation, undefined);
+      assert.ok(call.prompt.includes("## 验收结论\n- verdict：通过\n- 证据：tests passed"));
+      if (flow === runBigFlow) assert.ok(call.prompt.includes(`## 评审结论\n${pass}`));
+    }
+  });
+}
+
+for (const [name, reply, report] of [
+  ["rejection", reject, reject],
+  ["unparseable verdict", "inconclusive", "- verdict：打回\n- 打回原因：auditor returned no parseable verdict\ninconclusive"],
+] as const) {
+  test(`auditor ${name} escalates without a fix round`, async (context) => {
+    const { deps, rpc, text } = await fixture(context, { labels: "security-sensitive" });
+    scriptAudit(rpc, reply);
+    const summary = await runBigFlow(deps, { taskFile: filename });
+    const board = await text();
+    assert.equal(summary.status, "打回");
+    assert.equal(summary.escalated, true);
+    assert.equal(summary.escalationReason, "security audit rejected");
+    assert.equal(summary.fixRoundsUsed, 0);
+    assert.equal(rpc.calls.filter(call => call.type === "coder").length, 1);
+    assert.equal(rpc.calls[rpc.calls.length - 1].type, "security-auditor");
+    assert.equal(parseTaskFile(filename, board).status, "打回");
+    assert.equal(getSection(board, "安全审计"), report);
+  });
+}
+
+for (const flow of [runBigFlow, runSmallFlow]) {
+  test(`${flow.name} interrupts on auditor agent failure`, async (context) => {
+    const { deps, rpc, text } = await fixture(context, { labels: "security-sensitive" });
+    scriptAudit(rpc, new Error("audit unavailable"));
+    const summary = await flow(deps, { taskFile: filename });
+    const board = await text();
+    assert.equal(summary.status, "已中断");
+    assert.equal(summary.escalated, false);
+    assert.equal(parseTaskFile(filename, board).status, "已中断");
+    assert.match(getSection(board, "实现记录") ?? "", /security-auditor agent error: audit unavailable/);
+  });
 }
 
 test("the lock identifies its owner and can be reacquired after release", async (context) => {
@@ -436,6 +525,7 @@ test("QA and review spend the same fix budget and escalate on the final rejectio
   assert.deepEqual(result, {
     taskId: "T-001", runId: result.runId, status: "打回", rounds: 3,
     fixRoundsUsed: 2, escalated: true, gatePassed: true, qaEvidence: "tests passed",
+    escalationReason: "fix budget exhausted after 2 fix rounds",
   });
   const file = await text();
   assert.match(file, /^- 状态：打回$/m);
