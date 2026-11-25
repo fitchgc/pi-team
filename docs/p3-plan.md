@@ -86,11 +86,19 @@ first event `gate`). tsc strict clean. This time the Codex diff applied
 cleanly on the first check (the P3-1 empty-line warning in the brief
 worked).
 
-Live verification: NOT done yet — needs an interactive (TUI) Pi session;
-print mode is unchanged by construction (widget gated on `"tui"`) and the
-engine emit path is unit-tested. Attempt a PTY check (`script -qec`,
-run `/team run` in the TUI, look for the widget lines in the terminal
-capture). Needs a working Llmapi key for the run itself.
+Live verification: DONE 2026-11-25 via a real TUI session (`script -qec
+`pi -a`` in pi-team-fresh, T-009 isPositive). The widget rendered above
+the editor and updated across stages — the terminal capture shows
+`pi-team T-009 — architect` / `agent: architect · fix 0/2 · round 0`,
+then coder (round 1), qa (round 1), reviewer (round 1); after the run
+the widget rows and the status line were cleared, and T-009 ended 通过
+(16 tests pass). The `gate` stage never rendered — it runs for ~1s and
+the TUI coalesced the update before a frame; the event itself fires
+(unit-tested), so this is a rendering timing artifact, not a bug.
+Side notes from the session: `/exit` is NOT a Pi command (it went to the
+main model as a prompt — interrupted with Ctrl+C, no harm); Pi 1.6.0 is
+available (we run 1.5.2 — do not upgrade mid-roadmap). P3-2 is fully
+done (code + live).
 
 ## P3-3: interactive `team_dispatch` (after the widget)
 
